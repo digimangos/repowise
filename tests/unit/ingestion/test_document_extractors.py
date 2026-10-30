@@ -113,6 +113,13 @@ def test_registration_rejects_invalid_extractor_contract(extractor_registry):
     assert dict(document_extractors.all())["valid"].extensions == frozenset({".xyz"})
 
 
+@pytest.mark.parametrize("extension", [".tar.xyz", ".drawio.xml", "..xyz"])
+def test_registration_rejects_compound_extensions(extractor_registry, extension):
+    with pytest.raises(ValueError, match="invalid extension"):
+        _register("compound", FakeExtractor(extensions=frozenset({extension})))
+    assert not document_extractors.all()
+
+
 def test_validation_survives_a_preexisting_generic_seam(monkeypatch):
     from repowise.core.ingestion.document_extractors import DocumentExtractorRegistry
 
@@ -483,14 +490,31 @@ def test_working_tree_extraction_failures_are_not_reported_as_no_changes(
 
 @pytest.mark.asyncio
 async def test_cached_document_diff_needs_no_conversion(tmp_path, extractor_registry, monkeypatch):
+    from repowise.core.ingestion.parse_cache import ParseCache
+
     calls = tmp_path / "calls.txt"
     _register_spawn_extractor(monkeypatch, calls)
     path = tmp_path / "spec.xyz"
     path.write_bytes(b"source")
     await _ingest(tmp_path)
     monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_FAIL", "1")
-    parsed = ChangeDetector(tmp_path).parse_bytes(path.read_bytes(), "spec.xyz")
+    loads = []
+    original_load = ParseCache.load
+
+    def track_load(cache):
+        loads.append(cache)
+        original_load(cache)
+
+    monkeypatch.setattr(ParseCache, "load", track_load)
+    detector = ChangeDetector(tmp_path)
+    assert detector.parse_bytes(b"VALUE = 1", "main.py") is not None
+    assert loads == []
+    parsed = detector.parse_bytes(path.read_bytes(), "spec.xyz")
     assert parsed.file_info.extracted_source == b"# Extracted document\n\nsource\n"
+    again = detector.parse_bytes(path.read_bytes(), "spec.xyz")
+    assert again.file_info.extracted_source == parsed.file_info.extracted_source
+    assert again is not parsed
+    assert len(loads) == 1
     assert _extractor_calls(calls) == ["spec.xyz"]
 
 

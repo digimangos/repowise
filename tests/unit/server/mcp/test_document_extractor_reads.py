@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -109,15 +111,151 @@ def test_source_guards_do_not_read_outside_root(tmp_path, extractor_registry, mo
     root.mkdir()
     (root / "link.xyz").symlink_to(outside)
     assert _read_repo_text(root, "link.xyz") is None
+    assert read_repo_file_text(root, "link.xyz") is None
     assert _edit_sites._live_definition(
         root, SimpleNamespace(file_path="../outside.xyz"), "name", "python"
     ) == (0, 0)
 
 
+def test_symbol_reads_do_not_expose_generated_source_coordinates(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from repowise.core.ingestion import document_extractors as extraction
+    from repowise.server.mcp_server.tool_symbol.misses import _live_grep_fallback
+    from repowise.server.mcp_server.tool_symbol.text import _read_file_text
+
+    (tmp_path / "spec.xyz").write_bytes(b"binary document")
+
+    def unexpected_conversion(*args, **kwargs):
+        pytest.fail("Source-only reads must not invoke extraction")
+
+    monkeypatch.setattr(extraction, "extract_document", unexpected_conversion)
+    assert _read_file_text(tmp_path, "spec.xyz") is None
+    assert _live_grep_fallback(tmp_path, "spec.xyz", "synthetic") == []
+    (tmp_path / "main.py").write_text("def synthetic(): pass\n")
+    assert _live_grep_fallback(tmp_path, "main.py", "synthetic")[0]["line"] == 1
+
+
 @pytest.mark.asyncio
-async def test_skeleton_reader_skips_extracted_documents(tmp_path, extractor_registry):
+async def test_symbol_range_rejects_extracted_document(
+    tmp_path, extractor_registry, monkeypatch, setup_mcp
+):
+    from repowise.core.ingestion import document_extractors as extraction
+    from repowise.server.mcp_server import get_symbol
+
+    (tmp_path / "spec.xyz").write_bytes(b"binary document")
+    monkeypatch.setattr(extraction, "extract_document", lambda *a, **k: b"# Generated\n")
+    result = await get_symbol("spec.xyz:1-3")
+    assert "error" in result
+    assert not result.get("verified")
+    assert "source" not in result
+
+
+def test_optional_preview_degrades_on_extraction_failure(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from repowise.core.ingestion import document_extractors as extraction
+    from repowise.server.mcp_server.tool_context.preview import _file_preview
+
+    (tmp_path / "spec.xyz").write_bytes(b"binary document")
+
+    def fail(*args, **kwargs):
+        raise extraction.DocumentExtractionError("converter failed")
+
+    monkeypatch.setattr(extraction, "extract_document", fail)
+    assert _file_preview(tmp_path, "spec.xyz") is None
+
+
+@pytest.mark.parametrize("preview_stage", ["resolution", "card"])
+@pytest.mark.asyncio
+async def test_document_preview_does_not_block_event_loop(
+    tmp_path, extractor_registry, monkeypatch, preview_stage
+):
+    from repowise.core.ingestion import document_extractors as extraction
+    from repowise.server.mcp_server.tool_context.resolution import _live_file
+    from repowise.server.mcp_server.tool_context.targets import _attach_file_preview
+
+    (tmp_path / "spec.xyz").write_bytes(b"binary document")
+    started = threading.Event()
+    release = threading.Event()
+
+    def convert(*args, **kwargs):
+        started.set()
+        assert release.wait(2), "Event loop did not release the converter"
+        return b"# Converted\n"
+
+    monkeypatch.setattr(extraction, "extract_document", convert)
+    query = SimpleNamespace(repo_root=tmp_path, target="spec.xyz")
+    docs = {}
+    operation = (
+        _live_file(query) if preview_stage == "resolution"
+        else _attach_file_preview(SimpleNamespace(query=query, target="spec.xyz"), docs)
+    )
+    task = asyncio.create_task(operation)
+    try:
+        async with asyncio.timeout(1):
+            while not started.is_set():
+                await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+        result = await task
+    if preview_stage == "resolution":
+        assert result.live_unindexed_file
+    else:
+        assert docs["file_preview"]["head"] == ["# Converted"]
+
+
+@pytest.mark.parametrize("document_alias", [False, True])
+def test_symlink_routing_uses_indexed_path(
+    tmp_path, extractor_registry, monkeypatch, document_alias
+):
+    from repowise.core.ingestion import document_extractors as extraction
+    from repowise.core.ingestion.traverser import FileTraverser
+    from repowise.server.mcp_server import _code_rationale, _edit_sites
+    from repowise.server.mcp_server.tool_answer.data_shape import _read_lines
+    from repowise.server.mcp_server.tool_answer.projection import _file_size
+    from repowise.server.mcp_server.tool_symbol.text import _read_file_text
+
+    target = tmp_path / ("implementation.py" if document_alias else "implementation.xyz")
+    alias = tmp_path / ("alias.xyz" if document_alias else "alias.py")
+    target.write_text("VALUE = 1\n")
+    alias.symlink_to(target.name)
+    files = {info.path: info for info in FileTraverser(tmp_path).traverse()}
+    assert files[alias.name].language == ("markdown" if document_alias else "python")
+    calls = []
+
+    def convert(path, source):
+        calls.append(path)
+        return b"# Converted\n"
+
+    monkeypatch.setattr(extraction, "extract_document", convert)
+    assert read_repo_file_text(tmp_path, alias.name) == (
+        "# Converted\n" if document_alias else "VALUE = 1\n"
+    )
+    assert calls == ([alias] if document_alias else [])
+    for read in (_read_repo_text, _read_file_text, _code_rationale._read_text):
+        assert read(tmp_path, alias.name) == (None if document_alias else "VALUE = 1\n")
+    for read in (_read_lines, _edit_sites._read_lines):
+        assert read(tmp_path, alias.name) == (None if document_alias else ["VALUE = 1"])
+    assert _file_size(tmp_path, alias.name) == (
+        None if document_alias else (1, len(b"VALUE = 1\n"))
+    )
+    if document_alias:
+        assert _edit_sites._live_definition(
+            tmp_path, SimpleNamespace(file_path=alias.name), "VALUE", "python"
+        ) == (0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("symlink", [False, True])
+async def test_skeleton_reader_skips_extracted_documents(tmp_path, extractor_registry, symlink):
     document = tmp_path / "spec.xyz"
-    document.write_bytes(b"\x00binary source")
+    if symlink:
+        (tmp_path / "implementation.py").write_text("VALUE = 1\n")
+        document.symlink_to("implementation.py")
+    else:
+        document.write_bytes(b"\x00binary source")
     result: dict = {}
 
     class EmptyResult:

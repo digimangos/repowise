@@ -126,6 +126,7 @@ class ChangeDetector:
             "include_nested_repos": include_nested_repos,
         }
         self._document_policy = None
+        self._document_cache = None
         self._repo: object = None  # lazy git.Repo
         # Where repo_path sits inside the git working tree ("" when it is the
         # root). Git reports root-relative paths; the index is keyed relative
@@ -643,9 +644,10 @@ class ChangeDetector:
             if extractor_name is not None:
                 from .parse_cache import ParseCache
 
-                cache = ParseCache(self.repo_path / ".repowise")
-                cache.load()
-                cached = cache.get(file_info, source_fingerprint(file_info, source))
+                if self._document_cache is None:
+                    self._document_cache = ParseCache(self.repo_path / ".repowise")
+                    self._document_cache.load()
+                cached = self._document_cache.get(file_info, source_fingerprint(file_info, source))
                 if cached is not None:
                     from .document_extractors import validate_document_output
 

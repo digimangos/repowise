@@ -270,7 +270,7 @@ async def _file_docs(card: CardState, docs: dict[str, Any]) -> None:
     # A symbol-less file still has content: one read serves counts and a
     # verbatim excerpt instead of a card that restates the filename.
     if not symbols:
-        _attach_file_preview(card, docs)
+        await _attach_file_preview(card, docs)
 
 
 async def _compact_file_symbols(card: CardState, docs: dict[str, Any], symbols: Any) -> None:
@@ -346,8 +346,10 @@ async def _file_importers_and_community(card: CardState, docs: dict[str, Any]) -
         }
 
 
-def _attach_file_preview(card: CardState, docs: dict[str, Any]) -> None:
-    preview = _file_preview(card.query.repo_root, card.target)
+async def _attach_file_preview(card: CardState, docs: dict[str, Any]) -> None:
+    import asyncio
+
+    preview = await asyncio.to_thread(_file_preview, card.query.repo_root, card.target)
     if preview is not None:
         docs["file_preview"] = preview
         # Replace the stub summary with the preview's own counts.

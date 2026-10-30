@@ -874,7 +874,7 @@ def _file_size(root: Path, path: str) -> tuple[int | None, int] | None:
         size = abs_path.stat().st_size
         if size > _LINE_COUNT_MAX_BYTES:
             return None, size
-        if is_extracted_document(abs_path):
+        if is_extracted_document(root / path):
             return None
         lines, last = 0, b""
         with abs_path.open("rb") as handle:

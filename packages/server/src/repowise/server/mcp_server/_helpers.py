@@ -684,7 +684,9 @@ def _compute_alignment(
 # ---------------------------------------------------------------------------
 
 
-def read_repo_file_text(repo_root: Path | str | None, file_path: str) -> str | None:
+def read_repo_file_text(
+    repo_root: Path | str | None, file_path: str, *, allow_extracted: bool = True
+) -> str | None:
     """Read a repo-relative file's live text, or None when it cannot be served.
 
     Refuses any path that resolves outside *repo_root*: several tools serve
@@ -693,6 +695,9 @@ def read_repo_file_text(repo_root: Path | str | None, file_path: str) -> str | N
     card describing a latin-1 file should degrade to mojibake in one field,
     rather than failing the whole call.
 
+    Source-coordinate readers must set ``allow_extracted=False``. Async callers
+    allowing extraction must offload this synchronous reader.
+
     Several tool modules still carry their own near-identical copy of this,
     each with one extra behaviour bolted on (a size ceiling, lines instead of
     text). Those are left alone here rather than churned, but new callers
@@ -700,27 +705,32 @@ def read_repo_file_text(repo_root: Path | str | None, file_path: str) -> str | N
     """
     if repo_root is None:
         return None
+    from repowise.core.ingestion.document_extractors import (
+        DocumentExtractionError,
+        extract_document,
+        is_extracted_document,
+    )
+
     try:
         root = Path(str(repo_root))
-        abs_path = (root / file_path).resolve()
+        indexed_path = root / file_path
+        abs_path = indexed_path.resolve()
         abs_path.relative_to(root.resolve())
 
-        from repowise.core.ingestion.document_extractors import (
-            extract_document,
-            is_extracted_document,
-        )
         from repowise.core.ingestion.traverser import _DEFAULT_MAX_FILE_SIZE_BYTES
 
-        if is_extracted_document(abs_path):
+        if is_extracted_document(indexed_path):
+            if not allow_extracted:
+                return None
             with abs_path.open("rb") as stream:
                 source = stream.read(_DEFAULT_MAX_FILE_SIZE_BYTES + 1)
             if len(source) > _DEFAULT_MAX_FILE_SIZE_BYTES:
                 return None
-            source = extract_document(abs_path, source)
+            source = extract_document(indexed_path, source)
         else:
             source = abs_path.read_bytes()
         return source.decode("utf-8", errors="replace")
-    except (OSError, ValueError):
+    except (OSError, ValueError, DocumentExtractionError):
         return None
 
 

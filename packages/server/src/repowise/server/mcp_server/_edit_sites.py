@@ -120,7 +120,7 @@ def _read_lines(root: Path, rel: str) -> list[str] | None:
         abs_path.relative_to(root.resolve())
         from repowise.core.ingestion.document_extractors import is_extracted_document
 
-        if abs_path.stat().st_size > _MAX_FILE_BYTES or is_extracted_document(abs_path):
+        if abs_path.stat().st_size > _MAX_FILE_BYTES or is_extracted_document(root / rel):
             return None
     except (OSError, ValueError):
         return None
@@ -560,7 +560,7 @@ def _live_definition(root: Path, node: GraphNode, name: str, language: str) -> t
     try:
         abs_path = (root / node.file_path).resolve()
         abs_path.relative_to(root.resolve())
-        if is_extracted_document(abs_path):
+        if is_extracted_document(root / node.file_path):
             return (0, 0)
     except (OSError, ValueError):
         return (0, 0)

@@ -7,6 +7,7 @@ finished error/degrade payload) or returns None to fall through. They run in
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -351,7 +352,7 @@ async def _git_metadata(q: TargetQuery) -> Resolution | None:
 async def _live_file(q: TargetQuery) -> Resolution | None:
     """A live file never indexed into git_metadata is still a valid public
     path; resolve it from the checkout."""
-    if _file_preview(q.repo_root, q.target) is not None:
+    if await asyncio.to_thread(_file_preview, q.repo_root, q.target) is not None:
         return ResolvedTarget("file", file_path=q.target, live_unindexed_file=True)
     return None
 

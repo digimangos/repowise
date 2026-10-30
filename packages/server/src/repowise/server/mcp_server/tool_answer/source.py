@@ -28,7 +28,7 @@ def _read_repo_text(repo_root: Path | None, file_path: str) -> str | None:
         abs_path.relative_to(repo_root.resolve())
         from repowise.core.ingestion.document_extractors import is_extracted_document
 
-        if is_extracted_document(abs_path):
+        if is_extracted_document(repo_root / file_path):
             return None
         return abs_path.read_text(encoding="utf-8", errors="replace")
     except (OSError, ValueError):

@@ -26,6 +26,7 @@ def _validate_extension(name: str, extension: object) -> None:
         raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
     if (
         not extension.startswith(".")
+        or extension.count(".") != 1
         or extension != extension.lower()
         or len(extension) < 2
         or "/" in extension

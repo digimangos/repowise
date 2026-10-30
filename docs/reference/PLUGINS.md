@@ -223,7 +223,7 @@ module in the last column and call `.register(name, impl)`, for example
 | `change-metadata` | `change_metadata_sources` | one | when change records are stored | propagates | `packages/core/src/repowise/core/changes/source.py` |
 | `suspect-signal` | `suspect_signals` | every | `repowise suspects` ranks candidate changes | that signal does not fire; the others still rank | `packages/core/src/repowise/core/suspects/rank.py` |
 | `advisory-source` | `advisory_sources` | one | `repowise packages import` reads an advisory file | propagates | `packages/core/src/repowise/core/inventory/advisories.py` |
-| `document-extractors` | `document_extractors` | every; later extension claim wins | During traversal and source reads for otherwise unsupported extensions | propagates with plugin name and original path | `packages/core/src/repowise/core/ingestion/document_extractors.py` |
+| `document-extractors` | `document_extractors` | every; later extension claim wins | During traversal and source reads for otherwise unsupported extensions | indexing propagates with plugin name and original path; optional previews omit unavailable content | `packages/core/src/repowise/core/ingestion/document_extractors.py` |
 | `team-directory` | `team_directories` | one | when components and declared owners load | propagates | `packages/core/src/repowise/core/ownership/directory.py` |
 | `authenticator` | `authenticators` | one | each `repowise serve` request and MCP HTTP request | propagates | `packages/server/src/repowise/server/auth.py` |
 | `authorizer` | `authorizers` | one | each repository or tool access check in `repowise serve`, MCP over HTTP and chat | propagates | `packages/server/src/repowise/server/auth.py` |
@@ -309,7 +309,8 @@ then select both with `REPOWISE_SEAM_AUTHENTICATOR` and
 The `document-extractors` seam is format-agnostic. A plugin claims lower-case
 extensions that Repowise does not already process and returns Markdown from
 `extract(path, data)`. Registration requires a non-empty set of valid
-extensions, a non-empty string `version`, and a callable `extract` method.
+single-suffix extensions (for example `.pptx`, not `.drawio.xml`), a non-empty
+string `version`, and a callable `extract` method.
 Supported language extensions and files whose bytes identify a supported
 language (including shebang scripts) keep their normal parser and cannot be
 claimed by an extractor.
