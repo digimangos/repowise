@@ -307,7 +307,7 @@ def _read_and_parse_misses(
     with timed(timings, "rebuild.read"):
         file_bytes = _read_sources(file_infos, None)
         parse_cache, cached_hits, to_parse = _split_cached(
-            Path(repo_path), file_bytes, None
+            Path(repo_path), file_bytes, None, write_cache=not read_only
         )
     if read_only:
         parse_cache = None

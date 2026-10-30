@@ -500,8 +500,11 @@ def test_working_tree_extraction_failures_are_not_reported_as_no_changes(
         ChangeDetector(repo).get_working_tree_changes()
 
 
+@pytest.mark.parametrize("document_cache_state", ["warm", "missing", "corrupt"])
 @pytest.mark.asyncio
-async def test_cached_document_diff_needs_no_conversion(tmp_path, extractor_registry, monkeypatch):
+async def test_cached_document_diff_needs_no_conversion(
+    tmp_path, extractor_registry, monkeypatch, document_cache_state
+):
     from repowise.core.ingestion.parse_cache import ParseCache
 
     calls = tmp_path / "calls.txt"
@@ -509,6 +512,11 @@ async def test_cached_document_diff_needs_no_conversion(tmp_path, extractor_regi
     path = tmp_path / "spec.xyz"
     path.write_bytes(b"source")
     await _ingest(tmp_path)
+    [entry] = (tmp_path / ".repowise" / "document-cache").iterdir()
+    if document_cache_state == "missing":
+        entry.unlink()
+    elif document_cache_state == "corrupt":
+        entry.write_bytes(b"corrupt")
     monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_FAIL", "1")
     loads = []
     original_load = ParseCache.load

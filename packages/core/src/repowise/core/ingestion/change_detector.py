@@ -645,17 +645,16 @@ class ChangeDetector:
                 from .parse_cache import ParseCache
                 from .source_reader import read_document_sources
 
-                parse_source = read_document_sources(
-                    self.repo_path,
-                    [(extractor_name, extractor.version, Path(file_info.abs_path), path, source)],
-                )[0]
-
                 if self._document_cache is None:
                     self._document_cache = ParseCache(self.repo_path / ".repowise")
                     self._document_cache.load()
                 cached = self._document_cache.get(file_info, source_fingerprint(file_info, source))
                 if cached is not None:
                     return cached
+                parse_source = read_document_sources(
+                    self.repo_path,
+                    [(extractor_name, extractor.version, Path(file_info.abs_path), path, source)],
+                )[0]
             parsed = parse_file(file_info, parse_source)
             parsed.content_hash = source_fingerprint(file_info, source)
             return parsed

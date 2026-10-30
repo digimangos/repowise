@@ -357,6 +357,8 @@ def _split_cached(
     repo_path: Path,
     fi_and_bytes: list[tuple],
     progress: ProgressCallback | None,
+    *,
+    write_cache: bool = True,
 ) -> tuple[Any, dict[int, Any], list[tuple[int, tuple, str]]]:
     """Partition pre-read files into parse-cache hits and misses.
 
@@ -389,7 +391,7 @@ def _split_cached(
             if progress:
                 progress.on_item_done("parse")
 
-    _prepare_document_sources(repo_path, fi_and_bytes)
+    _prepare_document_sources(repo_path, fi_and_bytes, write_cache=write_cache)
     misses = [
         (idx, item, cache_hashes[idx])
         for idx, item in enumerate(fi_and_bytes)
@@ -401,7 +403,7 @@ def _split_cached(
 
 
 def _prepare_document_sources(
-    repo_path: Path, fi_and_bytes: list[tuple]
+    repo_path: Path, fi_and_bytes: list[tuple], *, write_cache: bool = True
 ) -> None:
     """Read Markdown at the shared boundary, independently of the parse cache."""
     from repowise.core.ingestion.source_reader import read_document_sources
@@ -421,7 +423,7 @@ def _prepare_document_sources(
             )
 
     extracted = read_document_sources(
-        repo_path, [request[1:] for request in requests]
+        repo_path, [request[1:] for request in requests], write_cache=write_cache
     )
     for (idx, *_request), parse_source in zip(requests, extracted, strict=True):
         fi, _raw_source = fi_and_bytes[idx]

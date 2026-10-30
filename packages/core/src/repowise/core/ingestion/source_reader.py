@@ -19,6 +19,8 @@ _log = logging.getLogger(__name__)
 def read_document_sources(
     repo_path: Path,
     requests: list[tuple[str, str, Path, str, bytes]],
+    *,
+    write_cache: bool = True,
 ) -> list[bytes]:
     """Read cached Markdown or batch-convert already eligible working-tree/Git bytes.
 
@@ -53,6 +55,8 @@ def read_document_sources(
     )
     for (index, cache_path, domain), markdown in zip(missing, converted, strict=True):
         outputs[index] = markdown
+        if not write_cache:
+            continue
         try:
             dump_sealed_pickle(cache_path, markdown, domain=domain)
         except Exception as exc:
