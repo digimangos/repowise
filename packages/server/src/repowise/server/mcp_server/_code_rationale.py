@@ -287,13 +287,11 @@ def _read_text(repo_root: Path, file_path: str) -> str | None:
         abs_path.relative_to(repo_root.resolve())
         from repowise.core.ingestion.document_extractors import is_extracted_document
 
-        if is_extracted_document(abs_path):
+        if abs_path.stat().st_size > _MAX_FILE_LINES * 400 or is_extracted_document(abs_path):
             return None
     except (ValueError, OSError):
         return None
     try:
-        if abs_path.stat().st_size > _MAX_FILE_LINES * 400:
-            return None
         return abs_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None

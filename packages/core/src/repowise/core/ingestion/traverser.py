@@ -954,6 +954,18 @@ class FileTraverser:
             extractor_version=extractor_version,
         )
 
+    def document_source_eligible(self, path: str, size_bytes: int) -> bool:
+        """Apply current traversal policy to supplied document bytes, even after deletion."""
+        relative = Path(path)
+        if relative.is_absolute() or ".." in relative.parts:
+            return False
+        abs_path = self.repo_root / relative
+        if self.dir_chain_skipped(relative.parent):
+            return False
+        if self._excluding_rule(abs_path, relative.as_posix()) is not None:
+            return False
+        return self._oversize_skip_reason(abs_path, size_bytes) is None
+
     def _is_package_root_dir(self, rel_dir: str) -> bool:
         """Whether *rel_dir* holds a package manifest, so it ships as a package.
 
@@ -1240,15 +1252,16 @@ def _content_language(
 def _detect_language(abs_path: Path, source: bytes | None = None) -> LanguageTag:
     """Detect the language of a file from name, extension, content, or shebang."""
     lang = _content_language(abs_path, _language_from_name_or_ext(abs_path), source)
-    return lang if lang is not None else _detect_by_shebang(abs_path)
+    return lang if lang is not None else _detect_by_shebang(abs_path, source)
 
 
-def _detect_by_shebang(abs_path: Path) -> LanguageTag:
-    try:
-        with open(abs_path, encoding="utf-8", errors="ignore") as f:
-            first_line = f.readline(200)
-    except OSError:
+def _detect_by_shebang(abs_path: Path, source: bytes | None = None) -> LanguageTag:
+    """Classify an interpreter line from the bytes supplied by the caller."""
+    head = _head(abs_path, source, 800)
+    if head is None:
         return "unknown"
+    text = head.decode("utf-8", errors="ignore")
+    first_line = text.splitlines()[0][:200] if text else ""
     if not first_line.startswith("#!"):
         return "unknown"
     for spec in _LANG_REGISTRY.all_specs():
@@ -1950,19 +1963,19 @@ def is_candidate_source_path(
 ) -> bool:
     """Whether *rel_path* is shaped like a file this repo would index.
 
-    Path-shape only: the directory blocklist, the blocked extensions/filename
-    patterns, and the known-language extension map. No gitignore, no
-    binary/size/generated checks, so a ``True`` answer means "worth handing to
-    the pipeline", never "will be indexed". :class:`FileTraverser` still
-    applies the full test on the files it walks. The only disk access is the
-    output-directory listing of :func:`in_blocked_dir`, given *repo_root*
-    (and memoized in *cache* when given).
+    Path-shape check: the directory blocklist, blocked extensions/filename
+    patterns, known-language extensions and registered document-extractor
+    claims. A ``True`` answer means "worth handing to the pipeline", never
+    "will be indexed"; :class:`FileTraverser` still applies the full test.
+    The only disk access is the output-directory listing of
+    :func:`in_blocked_dir`, given *repo_root* (and memoized in *cache* when
+    given).
 
     It serves the change sources that only see a path: the working-tree diff
     and the file watcher.
 
-    One known false negative: an extensionless script that :class:`FileTraverser`
-    accepts by shebang is rejected here, since deciding that means reading it.
+    Extensionless scripts are still rejected because deciding whether they
+    have a supported shebang would require reading them.
     """
     posix = rel_path.replace("\\", "/")
     parts = Path(posix).parts
@@ -1986,7 +1999,11 @@ def is_candidate_source_path(
         return False
     if _BLOCKED_FILENAME_SPEC.match_file(name):
         return False
-    return suffix in EXTENSION_TO_LANGUAGE or is_aura_markup_path(posix)
+    if suffix in EXTENSION_TO_LANGUAGE or is_aura_markup_path(posix):
+        return True
+    from .document_extractors import document_extractor_claims
+
+    return suffix in document_extractor_claims()
 
 
 def _compile_gitignore(lines: Iterable[str]) -> pathspec.PathSpec:

@@ -111,8 +111,21 @@ class ChangeDetector:
         repo_path: Path to the git repository root.
     """
 
-    def __init__(self, repo_path: Path) -> None:
+    def __init__(
+        self,
+        repo_path: Path,
+        *,
+        exclude_patterns: list[str] | None = None,
+        include_submodules: bool = False,
+        include_nested_repos: bool = False,
+    ) -> None:
         self.repo_path = repo_path
+        self._document_options = {
+            "extra_exclude_patterns": exclude_patterns,
+            "include_submodules": include_submodules,
+            "include_nested_repos": include_nested_repos,
+        }
+        self._document_policy = None
         self._repo: object = None  # lazy git.Repo
         # Where repo_path sits inside the git working tree ("" when it is the
         # root). Git reports root-relative paths; the index is keyed relative
@@ -148,9 +161,7 @@ class ChangeDetector:
             log.warning("git diff failed", base=base_ref, until=until_ref, error=str(exc))
             return []
 
-        return [
-            self._file_diff_from_item(item) for item in diff_items if self._item_in_scope(item)
-        ]
+        return [self._file_diff_from_item(item) for item in diff_items if self._item_in_scope(item)]
 
     def get_working_tree_changes(self) -> list[FileDiff]:
         """Return FileDiffs for changes that are in the working tree, not in git.
@@ -200,6 +211,10 @@ class ChangeDetector:
                 results.append(self._file_diff_from_item(item))
             untracked = self._untracked_files(repo)
         except Exception as exc:
+            from .document_extractors import DocumentExtractionError
+
+            if isinstance(exc, DocumentExtractionError):
+                raise
             log.warning("working tree diff failed", error=str(exc))
             return []
 
@@ -240,7 +255,23 @@ class ChangeDetector:
                 continue
             abs_path = self.repo_path / path
             if abs_path.is_file():
-                stale.append(self._added_from_disk(path, abs_path, status="modified"))
+                from .document_extractors import is_extracted_document
+
+                if not is_extracted_document(abs_path) or self._document_eligible(
+                    path, abs_path.stat().st_size
+                ):
+                    stale.append(self._added_from_disk(path, abs_path, status="modified"))
+                else:
+                    stale.append(
+                        FileDiff(
+                            path=path,
+                            status="deleted",
+                            old_path=path,
+                            old_parsed=None,
+                            new_parsed=None,
+                            symbol_diff=None,
+                        )
+                    )
             else:
                 stale.append(
                     FileDiff(
@@ -347,7 +378,6 @@ class ChangeDetector:
             new_parsed=new_parsed,
             symbol_diff=sym_diff,
         )
-
 
     def detect_symbol_renames(
         self,
@@ -588,6 +618,8 @@ class ChangeDetector:
         lang = _detect_language(Path(path), source)
         claim = document_extractor_for_path(Path(path), language=lang)
         if claim is not None:
+            if not self._document_eligible(path, len(source)):
+                return None
             extractor_name, extractor = claim
             lang = "markdown"
         else:
@@ -608,7 +640,16 @@ class ChangeDetector:
             extractor_version=extractor.version if extractor is not None else None,
         )
         try:
+            if extractor_name is not None:
+                from .parse_cache import ParseCache
+
+                cache = ParseCache(self.repo_path / ".repowise")
+                cache.load()
+                cached = cache.get(file_info, source_fingerprint(file_info, source))
+                if cached is not None:
+                    return cached
             parse_source = extract_document_source(file_info, source)
+            file_info.extracted_source = parse_source if extractor_name is not None else None
             parsed = parse_file(file_info, parse_source)
             parsed.content_hash = source_fingerprint(file_info, source)
             return parsed
@@ -619,6 +660,13 @@ class ChangeDetector:
                 raise
             log.warning("parse_file failed in ChangeDetector", path=path, error=str(exc))
             return None
+
+    def _document_eligible(self, path: str, size_bytes: int) -> bool:
+        from .traverser import FileTraverser
+
+        if self._document_policy is None:
+            self._document_policy = FileTraverser(self.repo_path, **self._document_options)
+        return self._document_policy.document_source_eligible(path, size_bytes)
 
     def _compute_symbol_diff(
         self,
@@ -740,9 +788,7 @@ def _counts_as_change(
     if not is_candidate_source_path(path, repo_path, output_dirs):
         return False
     a_blob = getattr(item, "a_blob", None)
-    committed = (
-        (lambda: a_blob.data_stream.read().decode("utf-8", "replace")) if a_blob else None
-    )
+    committed = (lambda: a_blob.data_stream.read().decode("utf-8", "replace")) if a_blob else None
     try:
         return not is_repowise_output(repo_path / path, path, committed)
     except Exception:
@@ -771,8 +817,6 @@ def merge_file_diffs(*sources: list[FileDiff]) -> list[FileDiff]:
     for source in sources:
         for diff in source:
             existing = merged.get(diff.path)
-            if existing is None or (
-                existing.status == "deleted" and diff.status != "deleted"
-            ):
+            if existing is None or (existing.status == "deleted" and diff.status != "deleted"):
                 merged[diff.path] = diff
     return list(merged.values())

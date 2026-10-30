@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,10 +17,14 @@ from repowise.core.ingestion.change_detector import ChangeDetector
 from repowise.core.ingestion.document_extractors import (
     DocumentExtractionError,
     document_extractors,
+    is_extracted_document,
 )
-from repowise.core.ingestion.traverser import FileTraverser
+from repowise.core.ingestion.traverser import FileTraverser, is_candidate_source_path
 from repowise.core.pipeline.phases import ingestion as ingestion_phase
 from repowise.core.registry import plugins
+from tests.unit.ingestion.document_extractor_spawn_plugin import SpawnExtractor
+
+SPAWN_PLUGIN = "tests.unit.ingestion.document_extractor_spawn_plugin:register"
 
 
 @dataclass
@@ -45,6 +51,20 @@ def extractor_registry(monkeypatch):
 
 def _register(name: str, extractor: FakeExtractor) -> None:
     document_extractors.register(name, extractor)
+
+
+def _register_spawn_extractor(
+    monkeypatch, calls_file: Path, *, fail: bool = False, hang: bool = False
+) -> None:
+    monkeypatch.setenv("REPOWISE_PLUGINS", SPAWN_PLUGIN)
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_CALLS", str(calls_file))
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_FAIL", "1" if fail else "0")
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_HANG", "1" if hang else "0")
+    document_extractors.register("spawn-test-extractor", SpawnExtractor())
+
+
+def _extractor_calls(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
 
 async def _ingest(repo: Path):
@@ -80,44 +100,246 @@ def test_traversal_routes_only_unsupported_claims(tmp_path, extractor_registry):
     assert first.calls == later.calls == python_extractor.calls == 0
 
 
-@pytest.mark.asyncio
-async def test_parse_cache_skips_extraction_until_source_or_version_changes(
-    tmp_path, extractor_registry
+def test_registration_rejects_invalid_extractor_contract(extractor_registry):
+    with pytest.raises(ValueError, match="invalid extension"):
+        document_extractors.register("bad-extractor", FakeExtractor(extensions=frozenset({"XYZ"})))
+
+    with pytest.raises(ValueError, match="version"):
+        document_extractors.register("missing-version", FakeExtractor(version=""))
+
+    _register("valid", FakeExtractor())
+    with pytest.raises(ValueError):
+        document_extractors.register("valid", FakeExtractor(extensions=frozenset({"pdf"})))
+    assert dict(document_extractors.all())["valid"].extensions == frozenset({".xyz"})
+
+
+def test_validation_survives_a_preexisting_generic_seam(monkeypatch):
+    from repowise.core.ingestion.document_extractors import DocumentExtractorRegistry
+
+    monkeypatch.setattr(plugins, "_SEAMS", {})
+    generic = plugins.SeamRegistry("document-extractors")
+    registry = DocumentExtractorRegistry("document-extractors")
+    assert registry is generic
+    with pytest.raises(ValueError, match="invalid extension"):
+        generic.register("invalid", FakeExtractor(extensions=frozenset({"pdf"})))
+
+
+def test_invalid_plugin_registration_is_reported_without_poisoning_valid_claims(
+    extractor_registry, monkeypatch
 ):
+    from types import SimpleNamespace
+
+    from repowise.core.ingestion.document_extractors import document_extractor_claims
+
+    _register("valid", FakeExtractor())
+    target = SimpleNamespace(
+        register=lambda: _register("bad", FakeExtractor(extensions=frozenset({"pdf"})))
+    )
+    monkeypatch.setattr(plugins.importlib, "import_module", lambda _name: target)
+    record = plugins.PluginRecord("bad-plugin", "env", "bad_plugin:register")
+    plugins._load(record)
+    assert record.status == "failed"
+    assert "invalid extension" in record.error
+    assert document_extractor_claims() == {".xyz": "valid"}
+
+
+def test_content_shebang_keeps_claimed_extension_on_code_path(tmp_path, extractor_registry):
     extractor = FakeExtractor()
     _register("test-extractor", extractor)
+    script = tmp_path / "script.xyz"
+    script.write_bytes(b"#!/usr/bin/env python3\nVALUE = 1\n")
+
+    assert not is_extracted_document(script)
+    assert is_candidate_source_path("script.xyz", tmp_path)
+    parsed = ChangeDetector(tmp_path).parse_bytes(script.read_bytes(), "script.xyz")
+
+    assert parsed is not None
+    assert parsed.file_info.language == "python"
+    assert parsed.file_info.extractor_name is None
+    assert extractor.calls == 0
+
+
+def test_supplied_shebang_bytes_never_read_live_source(tmp_path, extractor_registry, monkeypatch):
+    from repowise.core.ingestion.traverser import _detect_language
+
+    _register("test-extractor", FakeExtractor())
+    script = tmp_path / "script.xyz"
+    script.write_bytes(b"#!/bin/sh\n")
+    monkeypatch.chdir(tmp_path.parent)
+    assert _detect_language(script, b"#!/usr/bin/env python3\nVALUE = 1\n") == "python"
+    assert _detect_language(script, b"") == "unknown"
+    parsed = ChangeDetector(tmp_path).parse_bytes(
+        b"#!/usr/bin/env python3\nVALUE = 1\n", "script.xyz"
+    )
+    assert parsed.file_info.language == "python"
+
+
+@pytest.mark.asyncio
+async def test_parse_cache_skips_extraction_until_source_or_version_changes(
+    tmp_path, extractor_registry, monkeypatch
+):
+    calls_file = tmp_path / "extractor-calls.txt"
+    _register_spawn_extractor(monkeypatch, calls_file)
     path = tmp_path / "docs" / "spec.xyz"
     path.parent.mkdir()
     path.write_bytes(b"source-v1")
 
     first, _file_infos, _structure, source_map, *_ = await _ingest(tmp_path)
-    assert extractor.calls == 1
+    assert _extractor_calls(calls_file) == ["spec.xyz"]
     extracted = next(parsed for parsed in first if parsed.file_info.path == "docs/spec.xyz")
-    assert extracted.file_info.extracted_source == extractor.output.encode()
-    assert source_map["docs/spec.xyz"] == extractor.output.encode()
+    expected = b"# Extracted document\n\nsource-v1\n"
+    assert extracted.file_info.extracted_source == expected
+    assert source_map["docs/spec.xyz"] == expected
     assert not path.with_suffix(".md").exists()
 
     await _ingest(tmp_path)
-    assert extractor.calls == 1
+    assert _extractor_calls(calls_file) == ["spec.xyz"]
 
     path.write_bytes(b"source-v2")
     await _ingest(tmp_path)
-    assert extractor.calls == 2
+    assert _extractor_calls(calls_file) == ["spec.xyz", "spec.xyz"]
 
-    extractor.version = "2"
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_VERSION", "2")
+    document_extractors.register("spawn-test-extractor", SpawnExtractor())
     await _ingest(tmp_path)
-    assert extractor.calls == 3
+    assert _extractor_calls(calls_file) == ["spec.xyz", "spec.xyz", "spec.xyz"]
 
 
-def test_extractor_failure_names_plugin_and_path(tmp_path, extractor_registry):
-    extractor = FakeExtractor(failure=ValueError("conversion failed"))
-    _register("failing-extractor", extractor)
+@pytest.mark.asyncio
+async def test_reparse_uses_cached_markdown_in_its_source_map(
+    tmp_path, extractor_registry, monkeypatch
+):
+    calls_file = tmp_path / "extractor-calls.txt"
+    _register_spawn_extractor(monkeypatch, calls_file)
+    (tmp_path / "spec.xyz").write_bytes(b"source")
+    await _ingest(tmp_path)
+
+    from repowise.core.pipeline.reparse import reparse_repo
+
+    parsed, source_map, _structure = reparse_repo(tmp_path, [])
+
+    assert [item.file_info.path for item in parsed] == ["spec.xyz"]
+    assert source_map["spec.xyz"] == b"# Extracted document\n\nsource\n"
+    assert _extractor_calls(calls_file) == ["spec.xyz"]
+
+
+def test_extractor_failure_names_plugin_and_path(tmp_path, extractor_registry, monkeypatch):
+    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt", fail=True)
     path = tmp_path / "spec.xyz"
     path.write_bytes(b"\x00binary source")
     file_info = next(iter(FileTraverser(tmp_path).traverse()))
 
-    with pytest.raises(DocumentExtractionError, match=r"failing-extractor.*spec\.xyz"):
+    with pytest.raises(DocumentExtractionError, match=r"spawn-test-extractor.*spec\.xyz"):
         ingestion_phase._split_cached(tmp_path, [(file_info, path.read_bytes())], None)
+
+
+def test_extraction_output_is_capped_in_the_spawn_worker(tmp_path, extractor_registry, monkeypatch):
+    from repowise.core.ingestion.document_extractors import extract_documents_bounded
+
+    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_PADDING", "8388609")
+
+    with pytest.raises(DocumentExtractionError, match="8,388,608-byte extraction limit"):
+        extract_documents_bounded(
+            [("spawn-test-extractor", "1", tmp_path / "spec.xyz", "spec.xyz", b"small")]
+        )
+
+
+def test_extraction_input_is_capped_without_running_the_plugin(tmp_path, extractor_registry):
+    from repowise.core.ingestion.document_extractors import (
+        MAX_DOCUMENT_INPUT_BYTES,
+        extract_documents_bounded,
+    )
+
+    with pytest.raises(DocumentExtractionError, match="source exceeds"):
+        extract_documents_bounded(
+            [
+                (
+                    "not-dispatched",
+                    "1",
+                    tmp_path / "spec.xyz",
+                    "spec.xyz",
+                    b"x" * (MAX_DOCUMENT_INPUT_BYTES + 1),
+                )
+            ]
+        )
+
+
+def test_extractor_timeout_fails_instead_of_running_unprotected(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from repowise.core.ingestion.document_extractors import extract_documents_bounded
+    from repowise.core.pipeline import parse_pool
+
+    calls = tmp_path / "calls.txt"
+    _register_spawn_extractor(monkeypatch, calls, hang=True)
+    monkeypatch.setenv("REPOWISE_PARSE_TIMEOUT_S", "0.2")
+
+    with pytest.raises(DocumentExtractionError, match="timed out"):
+        extract_documents_bounded(
+            [("spawn-test-extractor", "1", tmp_path / "spec.xyz", "spec.xyz", b"small")]
+        )
+    assert _extractor_calls(calls) == ["spec.xyz"]
+    assert parse_pool.parse_timeout_s() == 0.2
+
+
+def test_unavailable_extractor_pool_does_not_run_plugin_in_parent(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from repowise.core.ingestion.document_extractors import extract_documents_bounded
+    from repowise.core.pipeline import parse_pool
+
+    calls = tmp_path / "calls.txt"
+    _register_spawn_extractor(monkeypatch, calls)
+
+    def unavailable(_workers):
+        raise RuntimeError("spawn unavailable")
+
+    monkeypatch.setattr(parse_pool, "_new_pool", unavailable)
+    with pytest.raises(DocumentExtractionError, match="could not run"):
+        extract_documents_bounded(
+            [("spawn-test-extractor", "1", tmp_path / "spec.xyz", "spec.xyz", b"small")]
+        )
+    assert not calls.exists()
+
+
+def test_crashed_extractor_worker_fails_with_original_path(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from repowise.core.ingestion.document_extractors import extract_documents_bounded
+
+    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_CRASH", "1")
+    with pytest.raises(DocumentExtractionError, match=r"spawn-test-extractor.*spec\.xyz.*crashed"):
+        extract_documents_bounded(
+            [("spawn-test-extractor", "1", tmp_path / "spec.xyz", "spec.xyz", b"source")]
+        )
+
+
+def test_worker_must_resolve_the_fingerprinted_extractor_version(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from repowise.core.ingestion.document_extractors import extract_document_source
+
+    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
+    document_extractors._impls["spawn-test-extractor"].version = "parent-only-version"
+    path = tmp_path / "spec.xyz"
+    path.write_bytes(b"source")
+    info = next(FileTraverser(tmp_path).traverse())
+    with pytest.raises(DocumentExtractionError, match="version changed"):
+        extract_document_source(info, path.read_bytes())
+
+
+def test_parent_only_registration_fails_explicitly(tmp_path, extractor_registry, monkeypatch):
+    from repowise.core.ingestion.document_extractors import extract_document_source
+
+    monkeypatch.delenv("REPOWISE_PLUGINS", raising=False)
+    _register("parent-only", FakeExtractor())
+    path = tmp_path / "spec.xyz"
+    path.write_bytes(b"source")
+    info = next(FileTraverser(tmp_path).traverse())
+    with pytest.raises(DocumentExtractionError, match=r"parent-only.*spec\.xyz.*not discoverable"):
+        extract_document_source(info, path.read_bytes())
 
 
 def test_exclusions_and_size_limit_run_before_extraction(tmp_path, extractor_registry):
@@ -140,9 +362,11 @@ def test_plugins_command_shows_effective_extension_owner(extractor_registry):
     assert json.loads(result.output)["document_extractors"] == {".xyz": "test-extractor"}
 
 
-def test_change_detector_uses_extracted_markdown_and_original_path(tmp_path, extractor_registry):
-    extractor = FakeExtractor()
-    _register("test-extractor", extractor)
+def test_change_detector_uses_extracted_markdown_and_original_path(
+    tmp_path, extractor_registry, monkeypatch
+):
+    calls_file = tmp_path / "calls.txt"
+    _register_spawn_extractor(monkeypatch, calls_file)
     path = tmp_path / "spec.xyz"
     path.write_bytes(b"\x00binary source")
 
@@ -151,5 +375,208 @@ def test_change_detector_uses_extracted_markdown_and_original_path(tmp_path, ext
     assert parsed is not None
     assert parsed.file_info.path == "spec.xyz"
     assert parsed.file_info.language == "markdown"
-    assert parsed.content_hash != hashlib.sha256(extractor.output.encode()).hexdigest()
-    assert extractor.calls == 1
+    assert parsed.content_hash != hashlib.sha256(parsed.file_info.extracted_source).hexdigest()
+    assert _extractor_calls(calls_file) == ["spec.xyz"]
+
+
+def test_working_tree_deletion_parses_historical_document_blob(
+    tmp_path, extractor_registry, monkeypatch
+):
+    calls_file = tmp_path / "extractor-calls.txt"
+    _register_spawn_extractor(monkeypatch, calls_file)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"], check=True
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True)
+    document = tmp_path / "spec.xyz"
+    document.write_bytes(b"historical document")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "spec.xyz"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "add document"], check=True)
+    document.unlink()
+
+    changes = ChangeDetector(tmp_path).get_working_tree_changes()
+
+    assert len(changes) == 1
+    assert changes[0].status == "deleted"
+    assert changes[0].old_parsed is not None
+    assert changes[0].old_parsed.file_info.language == "markdown"
+    assert _extractor_calls(calls_file) == ["spec.xyz"]
+
+
+def test_stale_extracted_document_deleted_when_traversal_excludes_it(tmp_path, extractor_registry):
+    _register("test-extractor", FakeExtractor())
+    (tmp_path / "spec.xyz").write_bytes(b"document")
+    (tmp_path / ".repowiseIgnore").write_text("spec.xyz\n", encoding="utf-8")
+
+    changes = ChangeDetector(tmp_path).stale_working_tree_diffs(["spec.xyz"], set())
+
+    assert len(changes) == 1
+    assert changes[0].status == "deleted"
+
+
+@pytest.mark.parametrize(
+    ("path", "ignore_file", "patterns", "source"),
+    [
+        ("ignored.xyz", ".repowiseIgnore", None, b"source"),
+        ("nested/ignored.xyz", "nested/.repowiseIgnore", None, b"source"),
+        ("ignored.xyz", None, ["*.xyz"], b"source"),
+        ("large.xyz", None, None, b"x" * (501 * 1024)),
+    ],
+)
+def test_diff_document_eligibility_checks_supplied_bytes_before_conversion(
+    tmp_path, extractor_registry, path, ignore_file, patterns, source
+):
+    _register("must-not-run", FakeExtractor(failure=AssertionError("not eligible")))
+    if ignore_file:
+        ignore = tmp_path / ignore_file
+        ignore.parent.mkdir(parents=True, exist_ok=True)
+        ignore.write_text("ignored.xyz\n", encoding="utf-8")
+    detector = ChangeDetector(tmp_path, exclude_patterns=patterns)
+    # No source exists on disk: the same boundary must handle historical blobs.
+    assert detector.parse_bytes(source, path) is None
+
+
+def test_working_tree_extraction_failures_are_not_reported_as_no_changes(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from tests.unit.cli.test_update_e2e import _git, _make_git_repo
+
+    repo = _make_git_repo(tmp_path)
+    (repo / "spec.xyz").write_bytes(b"old")
+    _git(repo, "add", "spec.xyz")
+    _git(repo, "commit", "-m", "add document")
+    (repo / "spec.xyz").write_bytes(b"changed")
+    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt", fail=True)
+    with pytest.raises(DocumentExtractionError, match="spawn-test-extractor"):
+        ChangeDetector(repo).get_working_tree_changes()
+
+
+@pytest.mark.asyncio
+async def test_cached_document_diff_needs_no_conversion(tmp_path, extractor_registry, monkeypatch):
+    calls = tmp_path / "calls.txt"
+    _register_spawn_extractor(monkeypatch, calls)
+    path = tmp_path / "spec.xyz"
+    path.write_bytes(b"source")
+    await _ingest(tmp_path)
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_FAIL", "1")
+    parsed = ChangeDetector(tmp_path).parse_bytes(path.read_bytes(), "spec.xyz")
+    assert parsed.file_info.extracted_source == b"# Extracted document\n\nsource\n"
+    assert _extractor_calls(calls) == ["spec.xyz"]
+
+
+@pytest.mark.parametrize("workspace", [False, True])
+def test_document_index_update_and_deletion_persist_for_repo_and_workspace(
+    tmp_path, extractor_registry, monkeypatch, workspace
+):
+    from repowise.cli.helpers import save_state
+    from repowise.cli.main import cli
+    from repowise.core.update_lock import release_update_lock
+    from tests.unit.cli.test_update_e2e import _db_snapshot, _git, _index_full, _make_git_repo
+    from tests.unit.cli.test_workspace_docs_pointer import (
+        CURRENT_GIT_HISTORY,
+        CURRENT_STORE_FORMAT,
+        _make_workspace,
+    )
+
+    repo = _make_workspace(tmp_path) if workspace else _make_git_repo(tmp_path)
+    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
+    document = repo / "spec.xyz"
+    document.write_bytes(b"initial")
+    _git(repo, "add", "spec.xyz")
+    _git(repo, "commit", "-m", "add document")
+    _index_full(repo)
+    assert any("spec.xyz" in node for node in asyncio.run(_db_snapshot(repo))["graph_node_ids"])
+    save_state(
+        repo,
+        {
+            "last_sync_commit": _git(repo, "rev-parse", "HEAD"),
+            "docs_enabled": False,
+            **CURRENT_GIT_HISTORY,
+            **CURRENT_STORE_FORMAT,
+        },
+    )
+    monkeypatch.chdir(repo.parent)
+    args = ["update", "--workspace"] if workspace else ["update", str(repo), "--no-workspace"]
+
+    def update():
+        try:
+            result = CliRunner().invoke(cli, [*args, "--working-tree"])
+            assert result.exit_code == 0, result.output
+            assert "already running" not in result.output
+            return result
+        finally:
+            # CliRunner does not exit the process and run the CLI's atexit cleanup.
+            release_update_lock(repo)
+
+    for committed in (True, False):
+        document.write_bytes(b"committed edit" if committed else b"working-tree edit")
+        if committed:
+            _git(repo, "add", "spec.xyz")
+            _git(repo, "commit", "-m", "edit document")
+        update()
+        from repowise.core.ingestion.document_extractors import source_fingerprint
+        from repowise.core.ingestion.parse_cache import ParseCache
+
+        info = next(fi for fi in FileTraverser(repo).traverse() if fi.path == "spec.xyz")
+        cache = ParseCache(repo / ".repowise")
+        cache.load()
+        assert cache.get(info, source_fingerprint(info, document.read_bytes())) is not None
+        assert any("spec.xyz" in node for node in asyncio.run(_db_snapshot(repo))["graph_node_ids"])
+    document.unlink()
+    _git(repo, "add", "-u")
+    _git(repo, "commit", "-m", "delete document")
+    result = update()
+    assert not any(
+        "spec.xyz" in node for node in asyncio.run(_db_snapshot(repo))["graph_node_ids"]
+    ), result.output
+    if workspace:
+        return
+    transient = repo / "transient.xyz"
+    transient.write_bytes(b"untracked")
+    update()
+    assert any(
+        "transient.xyz" in node for node in asyncio.run(_db_snapshot(repo))["graph_node_ids"]
+    )
+    transient.unlink()
+    result = update()
+    assert not any(
+        "transient.xyz" in node for node in asyncio.run(_db_snapshot(repo))["graph_node_ids"]
+    ), result.output
+
+
+def test_failed_document_update_does_not_publish_index_state_or_cache(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from repowise.cli.helpers import save_state
+    from repowise.cli.main import cli
+    from tests.unit.cli.test_update_e2e import _db_snapshot, _git, _index_full, _make_git_repo
+    from tests.unit.cli.test_workspace_docs_pointer import CURRENT_GIT_HISTORY, CURRENT_STORE_FORMAT
+
+    repo = _make_git_repo(tmp_path)
+    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
+    (repo / "spec.xyz").write_bytes(b"initial")
+    _git(repo, "add", "spec.xyz")
+    _git(repo, "commit", "-m", "add document")
+    _index_full(repo)
+    save_state(
+        repo,
+        {
+            "last_sync_commit": _git(repo, "rev-parse", "HEAD"),
+            "docs_enabled": False,
+            **CURRENT_GIT_HISTORY,
+            **CURRENT_STORE_FORMAT,
+        },
+    )
+    before = asyncio.run(_db_snapshot(repo))
+    store = repo / ".repowise"
+    artefacts = [store / name for name in ("state.json", "knowledge-graph.json", "parse_cache.pkl")]
+    persisted = [path.read_bytes() for path in artefacts]
+    (repo / "spec.xyz").write_bytes(b"failing edit")
+    (repo / "c.py").write_text("def gamma():\n    return 3\n")
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_FAIL", "1")
+    result = CliRunner().invoke(cli, ["update", str(repo), "--no-workspace", "--working-tree"])
+    assert result.exit_code != 0
+    assert "spawn-test-extractor" in str(result.exception) + result.output
+    assert asyncio.run(_db_snapshot(repo)) == before
+    assert [path.read_bytes() for path in artefacts] == persisted

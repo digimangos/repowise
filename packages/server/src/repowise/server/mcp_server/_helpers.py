@@ -704,9 +704,21 @@ def read_repo_file_text(repo_root: Path | str | None, file_path: str) -> str | N
         root = Path(str(repo_root))
         abs_path = (root / file_path).resolve()
         abs_path.relative_to(root.resolve())
-        from repowise.core.ingestion.document_extractors import extract_document
 
-        source = extract_document(abs_path, abs_path.read_bytes())
+        from repowise.core.ingestion.document_extractors import (
+            MAX_DOCUMENT_INPUT_BYTES,
+            extract_document,
+            is_extracted_document,
+        )
+
+        if is_extracted_document(abs_path):
+            with abs_path.open("rb") as stream:
+                source = stream.read(MAX_DOCUMENT_INPUT_BYTES + 1)
+            if len(source) > MAX_DOCUMENT_INPUT_BYTES:
+                return None
+            source = extract_document(abs_path, source)
+        else:
+            source = abs_path.read_bytes()
         return source.decode("utf-8", errors="replace")
     except (OSError, ValueError):
         return None

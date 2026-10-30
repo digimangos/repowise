@@ -36,7 +36,9 @@ def reparse_repo(
     from repowise.core.ingestion import FileTraverser
     from repowise.core.pipeline.phases.ingestion import (
         _collect_parsed,
+        _merge_parse_results,
         _read_sources,
+        _split_cached,
         parse_guarded,
         report_parse_failures,
     )
@@ -50,12 +52,14 @@ def reparse_repo(
     file_infos = list(traverser.traverse())
     repo_structure = traverser.get_repo_structure()
 
-    # Same deadline pool as init, so a file that never finishes parsing is
-    # skipped here too instead of hanging the re-parse.
     fi_and_bytes = _read_sources(file_infos, None)
-    to_parse = [(idx, item, "") for idx, item in enumerate(fi_and_bytes)]
+    parse_cache, cached_hits, to_parse = _split_cached(repo_path, fi_and_bytes, None)
+    # Share init/update's extractor-aware cache and bounded extraction route.
     results = parse_guarded(to_parse)
-    report_parse_failures(to_parse, results)  # logs each file it gave up on
+    report_parse_failures(to_parse, results)
+    merged = _merge_parse_results(cached_hits, to_parse, results, parse_cache)
+    if parse_cache is not None:
+        parse_cache.save()
     # Unreadable / unparseable files are skipped, as in init.
-    parsed_files, source_map = _collect_parsed(fi_and_bytes, dict(enumerate(results)))
+    parsed_files, source_map = _collect_parsed(fi_and_bytes, merged)
     return parsed_files, source_map, repo_structure

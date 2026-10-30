@@ -308,13 +308,47 @@ then select both with `REPOWISE_SEAM_AUTHENTICATOR` and
 
 The `document-extractors` seam is format-agnostic. A plugin claims lower-case
 extensions that Repowise does not already process and returns Markdown from
-`extract(path, data)`. Repowise keeps the original path and owns discovery,
-exclusions, size checks, change detection and deletion handling. The
-extractor's `version` participates in the content fingerprint. Bump it when
+`extract(path, data)`. Registration requires a non-empty set of valid
+extensions, a non-empty string `version`, and a callable `extract` method.
+Supported language extensions and files whose bytes identify a supported
+language (including shebang scripts) keep their normal parser and cannot be
+claimed by an extractor.
+
+Repowise keeps the original path and owns discovery, exclusions, size checks,
+change detection and deletion handling. The same current plugin claim is used
+when parsing working-tree files and historical Git blobs. Historical blobs are
+converted with the currently installed extractor; Repowise does not retain
+historical plugin implementations. The extractor's name, version and original
+source bytes participate in the parse-cache fingerprint. Bump `version` when
 extraction behaviour changes, then run `repowise init --force` to rebuild the
 repository index; an otherwise clean repository is not scanned just because a
 plugin version changed. Check `repowise plugins` to see which extractor owns a
-claimed extension.
+claimed extension. Change-history diffs use the current plugin for the
+historical blob's path and bytes; they do not replay old plugin versions or
+run a full repository traversal over each historical tree. Historical blob
+routing uses the changed path and that blob's bytes, applying the current
+invocation's exclusions, directory boundaries and source-size rules before
+conversion. It does not reconstruct historical ignore files or configuration.
+
+Extraction runs in the existing spawned parse-worker pool with the
+`REPOWISE_PARSE_TIMEOUT_S` per-file deadline (60 seconds by default; `0`
+disables the deadline). A timeout, worker crash, unavailable pool or extractor
+exception fails the indexing run;
+Repowise deliberately does not retry plugin code in-process. Each input and
+Markdown output is capped at 8 MiB; normal ingestion eligibility still uses the
+existing unsupported-file size limit (500 KiB by default). Workers also check
+that the discovered extractor version matches the fingerprinted version. The
+existing worker memory cap (`REPOWISE_PARSE_WORKER_MEMORY_MB`, 2048 MiB by
+default; `0` disables it) is applied where the platform supports it, so these
+are best-effort resource bounds rather than a hard host-memory
+guarantee. Because workers use `spawn`, the plugin must be importable there:
+install its entry point or make its module available through `REPOWISE_PLUGINS`
+and the worker's environment. A registration made only dynamically in the
+parent process is not sufficient. The deadline terminates Repowise's worker
+processes, but cannot guarantee termination of a separate subprocess that a
+plugin starts and detaches. Crash recovery may retry in-flight work, so plugins
+must tolerate repeated calls. These limits do not bound aggregate extracted
+content held by the parent process.
 
 ## Choosing an implementation
 

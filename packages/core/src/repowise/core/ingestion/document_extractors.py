@@ -10,6 +10,9 @@ from repowise.core.registry.plugins import SeamRegistry
 
 from .models import FileInfo
 
+MAX_DOCUMENT_INPUT_BYTES = 8 * 1024 * 1024
+MAX_DOCUMENT_OUTPUT_BYTES = 8 * 1024 * 1024
+
 
 class DocumentExtractor(Protocol):
     """Convert a claimed source file into Markdown for the existing parser."""
@@ -20,7 +23,48 @@ class DocumentExtractor(Protocol):
     def extract(self, path: Path, data: bytes) -> str: ...
 
 
-document_extractors: SeamRegistry[DocumentExtractor] = SeamRegistry("document-extractors")
+def _validate_document_extractor(name: str, extractor: DocumentExtractor) -> None:
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("document extractor name must be a non-empty string")
+    extensions = getattr(extractor, "extensions", None)
+    if not isinstance(extensions, (set, frozenset)) or not extensions:
+        raise ValueError(f"document extractor {name!r} must claim a non-empty set of extensions")
+    for extension in extensions:
+        if not isinstance(extension, str):
+            raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
+        if (
+            not extension.startswith(".")
+            or extension != extension.lower()
+            or len(extension) < 2
+            or "/" in extension
+            or "\\" in extension
+        ):
+            raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
+    version = getattr(extractor, "version", None)
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError(f"document extractor {name!r} must provide a non-empty string version")
+    if not callable(getattr(extractor, "extract", None)):
+        raise ValueError(f"document extractor {name!r} must provide extract(path, data)")
+
+
+class DocumentExtractorRegistry(SeamRegistry[DocumentExtractor]):
+    """A seam registry which rejects invalid extractor registrations immediately."""
+
+    def __new__(cls, seam: str) -> DocumentExtractorRegistry:
+        registry = super().__new__(cls, seam)
+        if not isinstance(registry, cls):
+            for name, extractor in registry._impls.items():
+                _validate_document_extractor(name, extractor)
+            # Preserve references if generic seam discovery created the singleton first.
+            registry.__class__ = cls
+        return registry
+
+    def register(self, name: str, impl: DocumentExtractor, *, default: bool = False) -> None:
+        _validate_document_extractor(name, impl)
+        super().register(name, impl, default=default)
+
+
+document_extractors: DocumentExtractorRegistry = DocumentExtractorRegistry("document-extractors")
 
 
 class DocumentExtractionError(RuntimeError):
@@ -31,16 +75,6 @@ def _extension_claims() -> dict[str, tuple[str, DocumentExtractor]]:
     claims: dict[str, tuple[str, DocumentExtractor]] = {}
     for name, extractor in document_extractors.all():
         for extension in extractor.extensions:
-            if not isinstance(extension, str):
-                raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
-            if (
-                not extension.startswith(".")
-                or extension != extension.lower()
-                or len(extension) < 2
-                or "/" in extension
-                or "\\" in extension
-            ):
-                raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
             claims[extension] = (name, extractor)
     return claims
 
@@ -70,9 +104,24 @@ def document_extractor_for_path(
     return _extension_claims().get(path.suffix.lower())
 
 
-def is_extracted_document(path: Path | str) -> bool:
-    """Whether *path* is routed through a document extractor."""
-    return document_extractor_for_path(path) is not None
+def is_extracted_document(
+    path: Path | str,
+    source: bytes | None = None,
+    *,
+    claims: dict[str, str] | None = None,
+) -> bool:
+    """Whether *path* is routed through a document extractor, not a code parser."""
+    from .traverser import _detect_language
+
+    path = Path(path)
+    owners = document_extractor_claims() if claims is None else claims
+    if path.suffix.lower() not in owners:
+        return False
+    if source is None:
+        with path.open("rb") as stream:
+            source = stream.read(131072)
+    language = _detect_language(path, source)
+    return language == "unknown"
 
 
 def source_fingerprint(file_info: FileInfo, source: bytes) -> str:
@@ -92,17 +141,13 @@ def source_fingerprint(file_info: FileInfo, source: bytes) -> str:
 
 
 def extract_document_source(file_info: FileInfo, source: bytes) -> bytes:
-    """Return extracted Markdown bytes, raising a named error on failure."""
+    """Return bounded extracted Markdown bytes, raising a named error on failure."""
     name = file_info.extractor_name
     if name is None:
         return source
-    return _extract(
-        name,
-        dict(document_extractors.all())[name],
-        Path(file_info.abs_path),
-        file_info.path,
-        source,
-    )
+    return extract_documents_bounded(
+        [(name, file_info.extractor_version, Path(file_info.abs_path), file_info.path, source)]
+    )[0]
 
 
 def extract_document(path: Path | str, source: bytes) -> bytes:
@@ -114,8 +159,87 @@ def extract_document(path: Path | str, source: bytes) -> bytes:
     if claim is None:
         return source
     name, extractor = claim
-    path = Path(path)
-    return _extract(name, extractor, path, str(path), source)
+    return extract_documents_bounded([(name, extractor.version, path, str(path), source)])[0]
+
+
+def _extract_worker(task: tuple[str, str, str, bytes]) -> bytes:
+    """Spawn-pool worker; plugins are rediscovered in the spawned process."""
+    name, version, path_text, source = task
+    path = Path(path_text)
+    try:
+        extractor = dict(document_extractors.all())[name]
+    except KeyError as exc:
+        raise DocumentExtractionError(
+            f"document extractor {name!r} is not discoverable in the spawned worker"
+        ) from exc
+    if extractor.version != version:
+        raise DocumentExtractionError(
+            f"document extractor {name!r} version changed from {version!r} "
+            f"to {extractor.version!r} in the spawned worker for {path}"
+        )
+    return _extract(name, extractor, path, path_text, source)
+
+
+def extract_documents_bounded(
+    requests: list[tuple[str, str, Path, str, bytes]],
+) -> list[bytes]:
+    """Extract a batch in the spawn pool; pool failures never run inline."""
+    if not requests:
+        return []
+    for name, _version, _path, display_path, source in requests:
+        if len(source) > MAX_DOCUMENT_INPUT_BYTES:
+            raise DocumentExtractionError(
+                f"document extractor {name!r} refused {display_path}: "
+                f"source exceeds {MAX_DOCUMENT_INPUT_BYTES:,} bytes"
+            )
+    from repowise.core.pipeline.parse_pool import (
+        PENDING,
+        ParseTimeoutError,
+        ParseWorkerCrashError,
+        parse_timeout_s,
+        run_with_deadline,
+    )
+    from repowise.core.pipeline.phases.ingestion import parse_pool_workers
+
+    results: list[object] = [PENDING] * len(requests)
+    try:
+        run_with_deadline(
+            _extract_worker,
+            [
+                (name, version, str(path), source)
+                for name, version, path, _display_path, source in requests
+            ],
+            parse_pool_workers(len(requests)),
+            results,
+            timeout=parse_timeout_s(),
+        )
+    except Exception as exc:
+        name, _version, _path, display_path, _source = requests[0]
+        raise DocumentExtractionError(
+            f"document extractor {name!r} could not run for {display_path}: {exc}"
+        ) from exc
+    extracted: list[bytes] = []
+    for (name, _version, _path, display_path, _source), result in zip(
+        requests, results, strict=True
+    ):
+        if isinstance(result, ParseTimeoutError | ParseWorkerCrashError):
+            raise DocumentExtractionError(
+                f"document extractor {name!r} failed for {display_path}: {result}"
+            ) from result
+        if isinstance(result, BaseException):
+            raise DocumentExtractionError(
+                f"document extractor {name!r} failed for {display_path}: {result}"
+            ) from result
+        if result is PENDING:
+            raise DocumentExtractionError(
+                f"document extractor {name!r} did not complete for {display_path}"
+            )
+        if not isinstance(result, bytes):
+            raise DocumentExtractionError(
+                f"document extractor {name!r} returned invalid output for {display_path}"
+            )
+        extracted.append(result)
+    return extracted
 
 
 def _extract(
@@ -129,7 +253,12 @@ def _extract(
         markdown = extractor.extract(extractor_path, source)
         if not isinstance(markdown, str):
             raise TypeError("extract() must return Markdown as str")
-        return markdown.encode("utf-8")
+        encoded = markdown.encode("utf-8")
+        if len(encoded) > MAX_DOCUMENT_OUTPUT_BYTES:
+            raise ValueError(
+                f"output exceeds the {MAX_DOCUMENT_OUTPUT_BYTES:,}-byte extraction limit"
+            )
+        return encoded
     except Exception as exc:
         raise DocumentExtractionError(
             f"document extractor {name!r} failed for {display_path}: {exc}"

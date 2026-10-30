@@ -369,7 +369,7 @@ def _split_cached(
     finishes). Cache failures degrade to all-miss.
     """
     from repowise.core.ingestion.document_extractors import (
-        extract_document_source,
+        extract_documents_bounded,
         source_fingerprint,
     )
     from repowise.core.ingestion.parse_cache import ParseCache
@@ -377,6 +377,8 @@ def _split_cached(
     cache = None
     hits: dict[int, Any] = {}
     misses: list[tuple[int, tuple, str]] = []
+    cache_hashes: dict[int, str] = {}
+    extraction_requests: list[tuple[int, str, str, Path, str, bytes]] = []
     try:
         cache = ParseCache(repo_path / ".repowise")
         cache.load()
@@ -385,24 +387,63 @@ def _split_cached(
 
     for idx, (fi, source) in enumerate(fi_and_bytes):
         content_hash = source_fingerprint(fi, source)
+        cache_hashes[idx] = content_hash
         parsed = cache.get(fi, content_hash) if cache is not None else None
         if parsed is not None:
             hits[idx] = parsed
             if fi.extractor_name is not None:
                 parse_source = fi.extracted_source
                 if parse_source is None:
-                    parse_source = extract_document_source(fi, source)
-                    fi.extracted_source = parse_source
-                    cache.put(parsed, content_hash)
-                fi_and_bytes[idx] = (fi, parse_source)
+                    extraction_requests.append(
+                        (
+                            idx,
+                            fi.extractor_name,
+                            fi.extractor_version,
+                            Path(fi.abs_path),
+                            fi.path,
+                            source,
+                        )
+                    )
+                else:
+                    fi_and_bytes[idx] = (fi, parse_source)
             if progress:
                 progress.on_item_done("parse")
         else:
-            parse_source = extract_document_source(fi, source)
             if fi.extractor_name is not None:
-                fi.extracted_source = parse_source
-                fi_and_bytes[idx] = (fi, parse_source)
-            misses.append((idx, (fi, parse_source), content_hash))
+                extraction_requests.append(
+                    (
+                        idx,
+                        fi.extractor_name,
+                        fi.extractor_version,
+                        Path(fi.abs_path),
+                        fi.path,
+                        source,
+                    )
+                )
+            else:
+                misses.append((idx, (fi, source), content_hash))
+
+    if extraction_requests:
+        extracted = extract_documents_bounded(
+            [
+                (name, version, path, display_path, source)
+                for _idx, name, version, path, display_path, source in extraction_requests
+            ]
+        )
+        for (idx, _name, _version, _path, _display_path, _source), parse_source in zip(
+            extraction_requests, extracted, strict=True
+        ):
+            fi, _raw_source = fi_and_bytes[idx]
+            fi.extracted_source = parse_source
+            fi_and_bytes[idx] = (fi, parse_source)
+            if idx in hits and cache is not None:
+                _cache_parsed(cache, hits[idx], cache_hashes[idx])
+
+    miss_indices = {miss[0] for miss in misses}
+    for idx, (fi, parse_source) in enumerate(fi_and_bytes):
+        if idx not in hits and idx not in miss_indices:
+            misses.append((idx, (fi, parse_source), cache_hashes[idx]))
+
     if cache is not None and hits:
         logger.info("parse_cache_used", hits=cache.hits, misses=cache.misses)
     return cache, hits, misses
@@ -723,7 +764,12 @@ async def _parse_stage(
     if progress:
         progress.on_phase_start("parse", len(file_infos))
     fi_and_bytes: list[tuple] = _read_sources(file_infos, progress)
-    parse_cache, cached_hits, to_parse = _split_cached(repo_path, fi_and_bytes, progress)
+    parse_cache, cached_hits, to_parse = await asyncio.to_thread(
+        _split_cached, repo_path, fi_and_bytes, None
+    )
+    if progress:
+        for _ in cached_hits:
+            progress.on_item_done("parse")
     parse_results = await _parse_misses(
         to_parse, progress, fallback_event=fallback_event, warn_on_fallback=warn_on_fallback
     )
