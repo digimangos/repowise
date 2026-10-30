@@ -704,7 +704,10 @@ def read_repo_file_text(repo_root: Path | str | None, file_path: str) -> str | N
         root = Path(str(repo_root))
         abs_path = (root / file_path).resolve()
         abs_path.relative_to(root.resolve())
-        return abs_path.read_text(encoding="utf-8", errors="replace")
+        from repowise.core.ingestion.document_extractors import extract_document
+
+        source = extract_document(abs_path, abs_path.read_bytes())
+        return source.decode("utf-8", errors="replace")
     except (OSError, ValueError):
         return None
 

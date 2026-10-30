@@ -554,6 +554,10 @@ class ChangeDetector:
             source = blob.data_stream.read()
             return self.parse_bytes(source, path)
         except Exception as exc:
+            from .document_extractors import DocumentExtractionError
+
+            if isinstance(exc, DocumentExtractionError):
+                raise
             log.warning("Failed to parse blob", path=path, error=str(exc))
             return None
 
@@ -562,6 +566,10 @@ class ChangeDetector:
         try:
             return self.parse_bytes(abs_path.read_bytes(), rel_path)
         except Exception as exc:
+            from .document_extractors import DocumentExtractionError
+
+            if isinstance(exc, DocumentExtractionError):
+                raise
             log.warning("Failed to parse file", path=rel_path, error=str(exc))
             return None
 
@@ -569,10 +577,22 @@ class ChangeDetector:
         """Parse one file's *source* as *path* with the repository's parser, or ``None``."""
         from datetime import datetime
 
+        from .document_extractors import (
+            document_extractor_for_path,
+            extract_document_source,
+            source_fingerprint,
+        )
         from .parser import parse_file
         from .traverser import _detect_language
 
         lang = _detect_language(Path(path), source)
+        claim = document_extractor_for_path(Path(path), language=lang)
+        if claim is not None:
+            extractor_name, extractor = claim
+            lang = "markdown"
+        else:
+            extractor_name = None
+            extractor = None
         file_info = FileInfo(
             path=path,
             abs_path=str(self.repo_path / path),
@@ -584,10 +604,19 @@ class ChangeDetector:
             is_config=False,
             is_api_contract=False,
             is_entry_point=False,
+            extractor_name=extractor_name,
+            extractor_version=extractor.version if extractor is not None else None,
         )
         try:
-            return parse_file(file_info, source)
+            parse_source = extract_document_source(file_info, source)
+            parsed = parse_file(file_info, parse_source)
+            parsed.content_hash = source_fingerprint(file_info, source)
+            return parsed
         except Exception as exc:
+            from .document_extractors import DocumentExtractionError
+
+            if isinstance(exc, DocumentExtractionError):
+                raise
             log.warning("parse_file failed in ChangeDetector", path=path, error=str(exc))
             return None
 

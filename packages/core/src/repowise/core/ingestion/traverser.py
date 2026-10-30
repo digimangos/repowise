@@ -837,12 +837,23 @@ class FileTraverser:
         # Name/extension lookup does no I/O; only an unrecognised extension
         # pays for binary and shebang sniffing.
         language = _content_language(abs_path, _language_from_name_or_ext(abs_path))
-        if language is not None:
+        shebang_language = None
+        if language in (None, "unknown"):
+            binary = _is_binary(abs_path)
+            if not binary:
+                shebang_language = _detect_by_shebang(abs_path)
+                if shebang_language != "unknown":
+                    return shebang_language
+            from .document_extractors import document_extractor_for_path
+
+            if document_extractor_for_path(abs_path) is not None:
+                return "markdown"
+            if binary:
+                self._count("skipped_binary")
+                return None
+        if language not in (None, "unknown"):
             return language
-        if _is_binary(abs_path):
-            self._count("skipped_binary")
-            return None
-        language = _detect_by_shebang(abs_path)
+        language = shebang_language or _detect_by_shebang(abs_path)
         if language == "unknown" and abs_path.suffix.lower() not in self._keep_unparsed:
             self._note_unknown_language(abs_path, rel_str, size_bytes)
             return None
@@ -894,6 +905,15 @@ class FileTraverser:
         language = self._resolve_language(abs_path, rel_str, size_bytes)
         if language is None or self._skip_generated(abs_path, rel_str, language):
             return None
+        extractor_name = None
+        extractor_version = None
+        if language == "markdown" and _language_from_name_or_ext(abs_path) is None:
+            from .document_extractors import document_extractor_for_path
+
+            claim = document_extractor_for_path(abs_path)
+            if claim is not None:
+                extractor_name, extractor = claim
+                extractor_version = extractor.version
 
         manifest_entry = (
             _is_console_script_target(rel_str, self._console_script_modules)
@@ -930,6 +950,8 @@ class FileTraverser:
             is_manifest_entry=manifest_entry,
             is_reachability_root=entry,
             is_application_main=app_main,
+            extractor_name=extractor_name,
+            extractor_version=extractor_version,
         )
 
     def _is_package_root_dir(self, rel_dir: str) -> bool:

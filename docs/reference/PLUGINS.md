@@ -38,6 +38,7 @@ Every row is listed in the [extension points catalog](#extension-points-catalog)
 | Internal API as an agent tool | `mcp-tool` | Gives agents a read-only tool that queries an internal service |
 | Team shortcut command | `cli-command` | Wraps a repowise workflow your team runs often in one command |
 | Phase timings | `pipeline-hook` | Records when each index phase starts and ends and sends the timings to your metrics system |
+| Extract an unsupported document type | `document-extractors` | Converts a plugin-supported file type to Markdown for the existing ingestion path |
 
 ## Build your first plugin
 
@@ -222,6 +223,7 @@ module in the last column and call `.register(name, impl)`, for example
 | `change-metadata` | `change_metadata_sources` | one | when change records are stored | propagates | `packages/core/src/repowise/core/changes/source.py` |
 | `suspect-signal` | `suspect_signals` | every | `repowise suspects` ranks candidate changes | that signal does not fire; the others still rank | `packages/core/src/repowise/core/suspects/rank.py` |
 | `advisory-source` | `advisory_sources` | one | `repowise packages import` reads an advisory file | propagates | `packages/core/src/repowise/core/inventory/advisories.py` |
+| `document-extractors` | `document_extractors` | every; later extension claim wins | During traversal and source reads for otherwise unsupported extensions | propagates with plugin name and original path | `packages/core/src/repowise/core/ingestion/document_extractors.py` |
 | `team-directory` | `team_directories` | one | when components and declared owners load | propagates | `packages/core/src/repowise/core/ownership/directory.py` |
 | `authenticator` | `authenticators` | one | each `repowise serve` request and MCP HTTP request | propagates | `packages/server/src/repowise/server/auth.py` |
 | `authorizer` | `authorizers` | one | each repository or tool access check in `repowise serve`, MCP over HTTP and chat | propagates | `packages/server/src/repowise/server/auth.py` |
@@ -303,6 +305,16 @@ Pair it with an authenticator that returns
 `Principal(id=..., kind="sso", claims={"roles": [...], "repo_ids": [...]})`,
 then select both with `REPOWISE_SEAM_AUTHENTICATOR` and
 `REPOWISE_SEAM_AUTHORIZER`.
+
+The `document-extractors` seam is format-agnostic. A plugin claims lower-case
+extensions that Repowise does not already process and returns Markdown from
+`extract(path, data)`. Repowise keeps the original path and owns discovery,
+exclusions, size checks, change detection and deletion handling. The
+extractor's `version` participates in the content fingerprint. Bump it when
+extraction behaviour changes, then run `repowise init --force` to rebuild the
+repository index; an otherwise clean repository is not scanned just because a
+plugin version changed. Check `repowise plugins` to see which extractor owns a
+claimed extension.
 
 ## Choosing an implementation
 

@@ -280,6 +280,25 @@ def can_lead_answer(row: dict) -> bool:
     return len(set(row.get("matched_terms") or ())) >= _LEAD_MIN_MATCHES
 
 
+def _read_text(repo_root: Path, file_path: str) -> str | None:
+    """Read a repo file's live text, refusing paths outside the root."""
+    try:
+        abs_path = (repo_root / file_path).resolve()
+        abs_path.relative_to(repo_root.resolve())
+        from repowise.core.ingestion.document_extractors import is_extracted_document
+
+        if is_extracted_document(abs_path):
+            return None
+    except (ValueError, OSError):
+        return None
+    try:
+        if abs_path.stat().st_size > _MAX_FILE_LINES * 400:
+            return None
+        return abs_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
 def _truncate_block(comment: str) -> str:
     """Bound a single surfaced block so a long docstring can't flood the
     payload."""

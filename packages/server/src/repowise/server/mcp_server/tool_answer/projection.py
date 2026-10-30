@@ -867,6 +867,10 @@ def _file_size(root: Path, path: str) -> tuple[int | None, int] | None:
         abs_path = (root / path).resolve()
         # An index row is not a trust boundary; refuse anything outside the repo.
         abs_path.relative_to(root.resolve())
+        from repowise.core.ingestion.document_extractors import is_extracted_document
+
+        if is_extracted_document(abs_path):
+            return None
         if not abs_path.is_file():
             return None
         size = abs_path.stat().st_size

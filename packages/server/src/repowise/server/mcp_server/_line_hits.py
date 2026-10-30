@@ -307,7 +307,11 @@ def scan_literal(
     per_file_capped = overflow = defs = 0
     deadline = time.monotonic() + MAX_SCAN_SECONDS
     undecodable = binary_hits = 0
+    from repowise.core.ingestion.document_extractors import is_extracted_document
+
     for i, rel in enumerate(files):
+        if is_extracted_document(root / rel):
+            continue
         if i >= MAX_SCAN_FILES:
             reasons.append(f"over {MAX_SCAN_FILES} files")
             break

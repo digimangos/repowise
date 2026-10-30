@@ -56,6 +56,7 @@ def _parse_misses(
     for (idx, _item, content_hash), parsed in zip(to_parse, results, strict=True):
         if isinstance(parsed, tuple | BaseException):
             continue
+        parsed.content_hash = content_hash
         merged[idx] = parsed
         if content_hash:
             _cache_parsed(parse_cache, parsed, content_hash)

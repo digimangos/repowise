@@ -368,7 +368,10 @@ def _split_cached(
     tick the parse progress bar here (misses tick when their worker
     finishes). Cache failures degrade to all-miss.
     """
-    from repowise.core.ingestion import compute_content_hash
+    from repowise.core.ingestion.document_extractors import (
+        extract_document_source,
+        source_fingerprint,
+    )
     from repowise.core.ingestion.parse_cache import ParseCache
 
     cache = None
@@ -379,18 +382,28 @@ def _split_cached(
         cache.load()
     except Exception as exc:
         logger.debug("parse_cache_init_failed", error=str(exc))
-        return None, hits, [(idx, item, "") for idx, item in enumerate(fi_and_bytes)]
 
     for idx, (fi, source) in enumerate(fi_and_bytes):
-        content_hash = compute_content_hash(source)
-        parsed = cache.get(fi, content_hash)
+        content_hash = source_fingerprint(fi, source)
+        parsed = cache.get(fi, content_hash) if cache is not None else None
         if parsed is not None:
             hits[idx] = parsed
+            if fi.extractor_name is not None:
+                parse_source = fi.extracted_source
+                if parse_source is None:
+                    parse_source = extract_document_source(fi, source)
+                    fi.extracted_source = parse_source
+                    cache.put(parsed, content_hash)
+                fi_and_bytes[idx] = (fi, parse_source)
             if progress:
                 progress.on_item_done("parse")
         else:
-            misses.append((idx, (fi, source), content_hash))
-    if hits:
+            parse_source = extract_document_source(fi, source)
+            if fi.extractor_name is not None:
+                fi.extracted_source = parse_source
+                fi_and_bytes[idx] = (fi, parse_source)
+            misses.append((idx, (fi, parse_source), content_hash))
+    if cache is not None and hits:
         logger.info("parse_cache_used", hits=cache.hits, misses=cache.misses)
     return cache, hits, misses
 
@@ -665,6 +678,8 @@ def _merge_parse_results(
     """Key fresh parses by traversal position next to the cache hits."""
     merged: dict[int, Any] = dict(cached_hits)
     for (idx, _item, content_hash), result in zip(to_parse, parse_results, strict=True):
+        if not isinstance(result, tuple | Exception):
+            result.content_hash = content_hash
         merged[idx] = result
         if not isinstance(result, tuple | Exception):
             _cache_parsed(parse_cache, result, content_hash)

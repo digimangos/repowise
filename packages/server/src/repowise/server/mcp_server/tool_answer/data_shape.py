@@ -233,6 +233,10 @@ def _read_lines(repo_root: Path, rel_path: str) -> list[str] | None:
     try:
         abs_path = (repo_root / rel_path).resolve()
         abs_path.relative_to(repo_root.resolve())
+        from repowise.core.ingestion.document_extractors import is_extracted_document
+
+        if is_extracted_document(abs_path):
+            return None
         return abs_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except (OSError, ValueError):
         return None
