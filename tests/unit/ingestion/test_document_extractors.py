@@ -66,9 +66,7 @@ def test_traversal_routes_only_unsupported_claims(tmp_path, extractor_registry):
     _register("python-override", python_extractor)
     (tmp_path / "spec.xyz").write_bytes(b"\x00binary source")
     (tmp_path / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (tmp_path / "script.xyz").write_text(
-        "#!/usr/bin/env python3\nVALUE = 2\n", encoding="utf-8"
-    )
+    (tmp_path / "script.xyz").write_text("#!/usr/bin/env python3\nVALUE = 2\n", encoding="utf-8")
 
     files = {info.path: info for info in FileTraverser(tmp_path).traverse()}
 
@@ -122,17 +120,13 @@ def test_extractor_failure_names_plugin_and_path(tmp_path, extractor_registry):
         ingestion_phase._split_cached(tmp_path, [(file_info, path.read_bytes())], None)
 
 
-def test_exclusions_and_size_limit_run_before_extraction(
-    tmp_path, extractor_registry
-):
+def test_exclusions_and_size_limit_run_before_extraction(tmp_path, extractor_registry):
     extractor = FakeExtractor()
     _register("test-extractor", extractor)
     path = tmp_path / "spec.xyz"
     path.write_bytes(b"\x00binary source")
 
-    assert list(
-        FileTraverser(tmp_path, extra_exclude_patterns=["*.xyz"]).traverse()
-    ) == []
+    assert list(FileTraverser(tmp_path, extra_exclude_patterns=["*.xyz"]).traverse()) == []
     assert list(FileTraverser(tmp_path, max_file_size_kb=0).traverse()) == []
     assert extractor.calls == 0
 
@@ -143,14 +137,10 @@ def test_plugins_command_shows_effective_extension_owner(extractor_registry):
     result = CliRunner().invoke(plugins_command, ["--format", "json"])
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["document_extractors"] == {
-        ".xyz": "test-extractor"
-    }
+    assert json.loads(result.output)["document_extractors"] == {".xyz": "test-extractor"}
 
 
-def test_change_detector_uses_extracted_markdown_and_original_path(
-    tmp_path, extractor_registry
-):
+def test_change_detector_uses_extracted_markdown_and_original_path(tmp_path, extractor_registry):
     extractor = FakeExtractor()
     _register("test-extractor", extractor)
     path = tmp_path / "spec.xyz"

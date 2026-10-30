@@ -32,9 +32,7 @@ def extractor_registry(monkeypatch):
     document_extractors.register("mcp-test-extractor", FakeExtractor())
 
 
-def test_generic_mcp_text_reader_returns_extracted_content(
-    tmp_path, extractor_registry
-):
+def test_generic_mcp_text_reader_returns_extracted_content(tmp_path, extractor_registry):
     document = tmp_path / "spec.xyz"
     document.write_bytes(b"\x00binary source")
 

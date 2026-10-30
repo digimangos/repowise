@@ -31,17 +31,16 @@ def _extension_claims() -> dict[str, tuple[str, DocumentExtractor]]:
     claims: dict[str, tuple[str, DocumentExtractor]] = {}
     for name, extractor in document_extractors.all():
         for extension in extractor.extensions:
+            if not isinstance(extension, str):
+                raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
             if (
-                not isinstance(extension, str)
-                or not extension.startswith(".")
+                not extension.startswith(".")
                 or extension != extension.lower()
                 or len(extension) < 2
                 or "/" in extension
                 or "\\" in extension
             ):
-                raise ValueError(
-                    f"document extractor {name!r} has invalid extension {extension!r}"
-                )
+                raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
             claims[extension] = (name, extractor)
     return claims
 
