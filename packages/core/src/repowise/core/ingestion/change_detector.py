@@ -665,7 +665,14 @@ class ChangeDetector:
         from .traverser import FileTraverser
 
         if self._document_policy is None:
-            self._document_policy = FileTraverser(self.repo_path, **self._document_options)
+            options = self._document_options.copy()
+            if options["extra_exclude_patterns"] is None:
+                from repowise.core.repo_config import load_repo_config
+
+                options["extra_exclude_patterns"] = load_repo_config(self.repo_path).get(
+                    "exclude_patterns"
+                )
+            self._document_policy = FileTraverser(self.repo_path, **options)
         return self._document_policy.document_source_eligible(path, size_bytes)
 
     def _compute_symbol_diff(

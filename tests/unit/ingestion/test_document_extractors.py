@@ -316,16 +316,21 @@ def test_crashed_extractor_worker_fails_with_original_path(
         )
 
 
+@pytest.mark.parametrize("changed_after_discovery", [False, True])
 def test_worker_must_resolve_the_fingerprinted_extractor_version(
-    tmp_path, extractor_registry, monkeypatch
+    tmp_path, extractor_registry, monkeypatch, changed_after_discovery
 ):
     from repowise.core.ingestion.document_extractors import extract_document_source
 
     _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
-    document_extractors._impls["spawn-test-extractor"].version = "parent-only-version"
+    if not changed_after_discovery:
+        document_extractors._impls["spawn-test-extractor"].version = "parent-only-version"
     path = tmp_path / "spec.xyz"
     path.write_bytes(b"source")
     info = next(FileTraverser(tmp_path).traverse())
+    if changed_after_discovery:
+        document_extractors._impls["spawn-test-extractor"].version = "new-version"
+        monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_VERSION", "new-version")
     with pytest.raises(DocumentExtractionError, match="version changed"):
         extract_document_source(info, path.read_bytes())
 
@@ -580,3 +585,50 @@ def test_failed_document_update_does_not_publish_index_state_or_cache(
     assert "spawn-test-extractor" in str(result.exception) + result.output
     assert asyncio.run(_db_snapshot(repo)) == before
     assert [path.read_bytes() for path in artefacts] == persisted
+
+
+def test_workspace_change_detection_applies_merged_excludes_before_conversion(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from repowise.core.workspace.update.repo import _changed_file_diffs
+    from tests.unit.cli.test_update_e2e import _git, _make_git_repo
+
+    repo = _make_git_repo(tmp_path)
+    (repo / "spec.xyz").write_bytes(b"old")
+    _git(repo, "add", "spec.xyz")
+    _git(repo, "commit", "-m", "add document")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "spec.xyz").write_bytes(b"excluded edit")
+    calls = tmp_path / "calls.txt"
+    _register_spawn_extractor(monkeypatch, calls, fail=True)
+    diffs, paths = _changed_file_diffs(repo, {}, base, True, ["*.xyz"])
+    assert paths == ["spec.xyz"]
+    assert len(diffs) == 1
+    assert diffs[0].old_parsed is diffs[0].new_parsed is None
+    assert not calls.exists()
+
+
+def test_default_document_policy_reads_current_repository_excludes(tmp_path, extractor_registry):
+    _register("must-not-run", FakeExtractor())
+    settings = tmp_path / ".repowise"
+    settings.mkdir()
+    (settings / "config.yaml").write_text("exclude_patterns:\n  - '*.xyz'\n")
+    assert ChangeDetector(tmp_path).parse_bytes(b"historical", "spec.xyz") is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_extraction_failure_does_not_fall_back_to_reindex(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from repowise.core.workspace.update.repo import _try_incremental_update
+    from tests.unit.cli.test_update_e2e import _git, _make_git_repo
+    from tests.unit.cli.test_workspace_docs_pointer import CURRENT_GIT_HISTORY
+
+    repo = _make_git_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "spec.xyz").write_bytes(b"failing addition")
+    _git(repo, "add", "spec.xyz")
+    _git(repo, "commit", "-m", "add document")
+    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt", fail=True)
+    with pytest.raises(DocumentExtractionError, match="spawn-test-extractor"):
+        await _try_incremental_update(repo, CURRENT_GIT_HISTORY, base, None, False)
