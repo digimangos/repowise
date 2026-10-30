@@ -23,6 +23,19 @@ class DocumentExtractor(Protocol):
     def extract(self, path: Path, data: bytes) -> str: ...
 
 
+def _validate_extension(name: str, extension: object) -> None:
+    if not isinstance(extension, str):
+        raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
+    if (
+        not extension.startswith(".")
+        or extension != extension.lower()
+        or len(extension) < 2
+        or "/" in extension
+        or "\\" in extension
+    ):
+        raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
+
+
 def _validate_document_extractor(name: str, extractor: DocumentExtractor) -> None:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("document extractor name must be a non-empty string")
@@ -30,16 +43,7 @@ def _validate_document_extractor(name: str, extractor: DocumentExtractor) -> Non
     if not isinstance(extensions, (set, frozenset)) or not extensions:
         raise ValueError(f"document extractor {name!r} must claim a non-empty set of extensions")
     for extension in extensions:
-        if not isinstance(extension, str):
-            raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
-        if (
-            not extension.startswith(".")
-            or extension != extension.lower()
-            or len(extension) < 2
-            or "/" in extension
-            or "\\" in extension
-        ):
-            raise ValueError(f"document extractor {name!r} has invalid extension {extension!r}")
+        _validate_extension(name, extension)
     version = getattr(extractor, "version", None)
     if not isinstance(version, str) or not version.strip():
         raise ValueError(f"document extractor {name!r} must provide a non-empty string version")

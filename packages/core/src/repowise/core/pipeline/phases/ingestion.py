@@ -368,17 +368,12 @@ def _split_cached(
     tick the parse progress bar here (misses tick when their worker
     finishes). Cache failures degrade to all-miss.
     """
-    from repowise.core.ingestion.document_extractors import (
-        extract_documents_bounded,
-        source_fingerprint,
-    )
+    from repowise.core.ingestion.document_extractors import source_fingerprint
     from repowise.core.ingestion.parse_cache import ParseCache
 
     cache = None
     hits: dict[int, Any] = {}
-    misses: list[tuple[int, tuple, str]] = []
     cache_hashes: dict[int, str] = {}
-    extraction_requests: list[tuple[int, str, str, Path, str, bytes]] = []
     try:
         cache = ParseCache(repo_path / ".repowise")
         cache.load()
@@ -391,62 +386,51 @@ def _split_cached(
         parsed = cache.get(fi, content_hash) if cache is not None else None
         if parsed is not None:
             hits[idx] = parsed
-            if fi.extractor_name is not None:
-                parse_source = fi.extracted_source
-                if parse_source is None:
-                    extraction_requests.append(
-                        (
-                            idx,
-                            fi.extractor_name,
-                            fi.extractor_version,
-                            Path(fi.abs_path),
-                            fi.path,
-                            source,
-                        )
-                    )
-                else:
-                    fi_and_bytes[idx] = (fi, parse_source)
             if progress:
                 progress.on_item_done("parse")
-        else:
-            if fi.extractor_name is not None:
-                extraction_requests.append(
-                    (
-                        idx,
-                        fi.extractor_name,
-                        fi.extractor_version,
-                        Path(fi.abs_path),
-                        fi.path,
-                        source,
-                    )
-                )
-            else:
-                misses.append((idx, (fi, source), content_hash))
 
-    if extraction_requests:
-        extracted = extract_documents_bounded(
-            [
-                (name, version, path, display_path, source)
-                for _idx, name, version, path, display_path, source in extraction_requests
-            ]
-        )
-        for (idx, _name, _version, _path, _display_path, _source), parse_source in zip(
-            extraction_requests, extracted, strict=True
-        ):
-            fi, _raw_source = fi_and_bytes[idx]
-            fi.extracted_source = parse_source
-            fi_and_bytes[idx] = (fi, parse_source)
-            if idx in hits and cache is not None:
-                _cache_parsed(cache, hits[idx], cache_hashes[idx])
-
-    miss_indices = {miss[0] for miss in misses}
-    for idx, (fi, parse_source) in enumerate(fi_and_bytes):
-        if idx not in hits and idx not in miss_indices:
-            misses.append((idx, (fi, parse_source), cache_hashes[idx]))
-
+    _prepare_document_sources(fi_and_bytes, hits, cache)
+    misses = [
+        (idx, item, cache_hashes[idx])
+        for idx, item in enumerate(fi_and_bytes)
+        if idx not in hits
+    ]
     if cache is not None and hits:
         logger.info("parse_cache_used", hits=cache.hits, misses=cache.misses)
     return cache, hits, misses
+
+
+def _prepare_document_sources(
+    fi_and_bytes: list[tuple], hits: dict[int, Any], cache: Any
+) -> None:
+    """Reuse cached Markdown and batch conversion of remaining document sources."""
+    from repowise.core.ingestion.document_extractors import extract_documents_bounded
+
+    requests = []
+    for idx, (fi, source) in enumerate(fi_and_bytes):
+        if fi.extractor_name is None:
+            continue
+        if idx in hits and fi.extracted_source is not None:
+            fi_and_bytes[idx] = (fi, fi.extracted_source)
+        else:
+            requests.append(
+                (
+                    idx,
+                    fi.extractor_name,
+                    fi.extractor_version,
+                    Path(fi.abs_path),
+                    fi.path,
+                    source,
+                )
+            )
+
+    extracted = extract_documents_bounded([request[1:] for request in requests])
+    for (idx, *_request), parse_source in zip(requests, extracted, strict=True):
+        fi, _raw_source = fi_and_bytes[idx]
+        fi.extracted_source = parse_source
+        fi_and_bytes[idx] = (fi, parse_source)
+        if idx in hits and cache is not None:
+            _cache_parsed(cache, hits[idx], hits[idx].content_hash)
 
 
 def _cache_parsed(cache: Any, parsed: Any, content_hash: str) -> None:
