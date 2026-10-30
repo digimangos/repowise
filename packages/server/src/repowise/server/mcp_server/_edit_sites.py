@@ -118,13 +118,11 @@ def _read_lines(root: Path, rel: str) -> list[str] | None:
     try:
         abs_path = (root / rel).resolve()
         abs_path.relative_to(root.resolve())
-        from repowise.core.ingestion.document_extractors import is_extracted_document
-
-        if abs_path.stat().st_size > _MAX_FILE_BYTES or is_extracted_document(root / rel):
+        if abs_path.stat().st_size > _MAX_FILE_BYTES:
             return None
     except (OSError, ValueError):
         return None
-    text = read_repo_file_text(root, rel)
+    text = read_repo_file_text(root, rel, allow_extracted=False)
     if text is None:
         return None
     # Only a newline ends a line: splitlines() also splits on form feeds and
@@ -555,16 +553,9 @@ def _jvm_package_files(
 
 def _live_definition(root: Path, node: GraphNode, name: str, language: str) -> tuple[int, int]:
     """*node*'s bounds re-parsed from its edited file; ``(0, 0)`` when it is not found."""
-    from repowise.core.ingestion.document_extractors import is_extracted_document
-
-    try:
-        abs_path = (root / node.file_path).resolve()
-        abs_path.relative_to(root.resolve())
-        if is_extracted_document(root / node.file_path):
-            return (0, 0)
-    except (OSError, ValueError):
+    text = read_repo_file_text(root, node.file_path, allow_extracted=False)
+    if text is None:
         return (0, 0)
-    text = read_repo_file_text(root, node.file_path)
     row = WikiSymbol(
         file_path=node.file_path,
         symbol_id=node.node_id,

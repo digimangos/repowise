@@ -357,8 +357,6 @@ def _split_cached(
     repo_path: Path,
     fi_and_bytes: list[tuple],
     progress: ProgressCallback | None,
-    *,
-    max_file_size_bytes: int | None = None,
 ) -> tuple[Any, dict[int, Any], list[tuple[int, tuple, str]]]:
     """Partition pre-read files into parse-cache hits and misses.
 
@@ -372,10 +370,6 @@ def _split_cached(
     """
     from repowise.core.ingestion.document_extractors import source_fingerprint
     from repowise.core.ingestion.parse_cache import ParseCache
-    from repowise.core.ingestion.traverser import _DEFAULT_MAX_FILE_SIZE_BYTES
-
-    if max_file_size_bytes is None:
-        max_file_size_bytes = _DEFAULT_MAX_FILE_SIZE_BYTES
 
     cache = None
     hits: dict[int, Any] = {}
@@ -395,7 +389,7 @@ def _split_cached(
             if progress:
                 progress.on_item_done("parse")
 
-    _prepare_document_sources(fi_and_bytes, hits, cache, max_file_size_bytes)
+    _prepare_document_sources(repo_path, fi_and_bytes)
     misses = [
         (idx, item, cache_hashes[idx])
         for idx, item in enumerate(fi_and_bytes)
@@ -407,25 +401,14 @@ def _split_cached(
 
 
 def _prepare_document_sources(
-    fi_and_bytes: list[tuple], hits: dict[int, Any], cache: Any, max_file_size_bytes: int
+    repo_path: Path, fi_and_bytes: list[tuple]
 ) -> None:
-    """Reuse cached Markdown and batch conversion of remaining document sources."""
-    from repowise.core.ingestion.document_extractors import (
-        extract_documents_bounded,
-        validate_document_output,
-    )
+    """Read Markdown at the shared boundary, independently of the parse cache."""
+    from repowise.core.ingestion.source_reader import read_document_sources
 
     requests = []
     for idx, (fi, source) in enumerate(fi_and_bytes):
-        if fi.extractor_name is None:
-            continue
-        if idx in hits and fi.extracted_source is not None:
-            validate_document_output(
-                fi.extractor_name, fi.path, fi.extracted_source,
-                max_file_size_bytes=max_file_size_bytes,
-            )
-            fi_and_bytes[idx] = (fi, fi.extracted_source)
-        else:
+        if fi.extractor_name is not None:
             requests.append(
                 (
                     idx,
@@ -437,15 +420,12 @@ def _prepare_document_sources(
                 )
             )
 
-    extracted = extract_documents_bounded(
-        [request[1:] for request in requests], max_file_size_bytes=max_file_size_bytes
+    extracted = read_document_sources(
+        repo_path, [request[1:] for request in requests]
     )
     for (idx, *_request), parse_source in zip(requests, extracted, strict=True):
         fi, _raw_source = fi_and_bytes[idx]
-        fi.extracted_source = parse_source
         fi_and_bytes[idx] = (fi, parse_source)
-        if idx in hits and cache is not None:
-            _cache_parsed(cache, hits[idx], hits[idx].content_hash)
 
 
 def _cache_parsed(cache: Any, parsed: Any, content_hash: str) -> None:
@@ -753,7 +733,6 @@ async def _parse_stage(
     *,
     fallback_event: str,
     warn_on_fallback: bool,
-    max_file_size_bytes: int | None = None,
 ) -> tuple[list[Any], dict[str, bytes]]:
     """Read, cache-split and parse *file_infos*; results keep their order.
 
@@ -766,7 +745,6 @@ async def _parse_stage(
     fi_and_bytes: list[tuple] = _read_sources(file_infos, progress)
     parse_cache, cached_hits, to_parse = await asyncio.to_thread(
         _split_cached, repo_path, fi_and_bytes, None,
-        max_file_size_bytes=max_file_size_bytes,
     )
     if progress:
         for _ in cached_hits:
@@ -998,7 +976,6 @@ async def _run_ingestion(
         progress,
         fallback_event="process_pool_parse_failed_falling_back",
         warn_on_fallback=True,
-        max_file_size_bytes=traverser.max_file_size_bytes,
     )
     graph_builder = _new_graph_builder(repo_path, traverser, parsed_files, source_map, walk)
     _phase_done(progress, "parse")
@@ -1072,7 +1049,6 @@ async def reparse_for_resume(
         progress,
         fallback_event="resume_reparse_pool_failed_falling_back",
         warn_on_fallback=False,
-        max_file_size_bytes=_traverser.max_file_size_bytes,
     )
     _phase_done(progress, "parse")
     tech_items = _detect_tech_items(repo_path, progress, consequence=".")

@@ -178,7 +178,6 @@ class ParseCache:
             return None
         self.hits += 1
         self._fresh[key] = blob
-        file_info.extracted_source = parsed.file_info.extracted_source
         parsed.file_info = file_info
         # Pickles written before ParsedFile carried content_hash deserialize
         # with the field empty; the cache key already proves the bytes match.

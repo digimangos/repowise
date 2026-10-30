@@ -52,6 +52,12 @@ def test_code_source_reader_keeps_a_shebang_script_on_the_code_path(tmp_path, ex
     assert _read_repo_text(tmp_path, "script.xyz") == script.read_text(encoding="utf-8")
 
 
+def test_shared_source_reader_preserves_text_newline_semantics(tmp_path, extractor_registry):
+    source = tmp_path / "main.py"
+    source.write_bytes(b"FIRST = 1\r\nSECOND = 2\rTHIRD = 3\n")
+    assert _read_repo_text(tmp_path, "main.py") == source.read_text(encoding="utf-8")
+
+
 def test_extracted_mcp_reads_enforce_input_budget_before_plugin_call(
     tmp_path, extractor_registry, monkeypatch
 ):
@@ -120,7 +126,7 @@ def test_source_guards_do_not_read_outside_root(tmp_path, extractor_registry, mo
 def test_symbol_reads_do_not_expose_generated_source_coordinates(
     tmp_path, extractor_registry, monkeypatch
 ):
-    from repowise.core.ingestion import document_extractors as extraction
+    from repowise.core.ingestion import source_reader
     from repowise.server.mcp_server.tool_symbol.misses import _live_grep_fallback
     from repowise.server.mcp_server.tool_symbol.text import _read_file_text
 
@@ -129,7 +135,7 @@ def test_symbol_reads_do_not_expose_generated_source_coordinates(
     def unexpected_conversion(*args, **kwargs):
         pytest.fail("Source-only reads must not invoke extraction")
 
-    monkeypatch.setattr(extraction, "extract_document", unexpected_conversion)
+    monkeypatch.setattr(source_reader, "extract_documents_bounded", unexpected_conversion)
     assert _read_file_text(tmp_path, "spec.xyz") is None
     assert _live_grep_fallback(tmp_path, "spec.xyz", "synthetic") == []
     (tmp_path / "main.py").write_text("def synthetic(): pass\n")
@@ -140,11 +146,11 @@ def test_symbol_reads_do_not_expose_generated_source_coordinates(
 async def test_symbol_range_rejects_extracted_document(
     tmp_path, extractor_registry, monkeypatch, setup_mcp
 ):
-    from repowise.core.ingestion import document_extractors as extraction
+    from repowise.core.ingestion import source_reader
     from repowise.server.mcp_server import get_symbol
 
     (tmp_path / "spec.xyz").write_bytes(b"binary document")
-    monkeypatch.setattr(extraction, "extract_document", lambda *a, **k: b"# Generated\n")
+    monkeypatch.setattr(source_reader, "extract_documents_bounded", lambda *a, **k: [b"# Generated\n"])
     result = await get_symbol("spec.xyz:1-3")
     assert "error" in result
     assert not result.get("verified")
@@ -155,6 +161,7 @@ def test_optional_preview_degrades_on_extraction_failure(
     tmp_path, extractor_registry, monkeypatch
 ):
     from repowise.core.ingestion import document_extractors as extraction
+    from repowise.core.ingestion import source_reader
     from repowise.server.mcp_server.tool_context.preview import _file_preview
 
     (tmp_path / "spec.xyz").write_bytes(b"binary document")
@@ -162,7 +169,7 @@ def test_optional_preview_degrades_on_extraction_failure(
     def fail(*args, **kwargs):
         raise extraction.DocumentExtractionError("converter failed")
 
-    monkeypatch.setattr(extraction, "extract_document", fail)
+    monkeypatch.setattr(source_reader, "extract_documents_bounded", fail)
     assert _file_preview(tmp_path, "spec.xyz") is None
 
 
@@ -171,7 +178,7 @@ def test_optional_preview_degrades_on_extraction_failure(
 async def test_document_preview_does_not_block_event_loop(
     tmp_path, extractor_registry, monkeypatch, preview_stage
 ):
-    from repowise.core.ingestion import document_extractors as extraction
+    from repowise.core.ingestion import source_reader
     from repowise.server.mcp_server.tool_context.resolution import _live_file
     from repowise.server.mcp_server.tool_context.targets import _attach_file_preview
 
@@ -182,9 +189,9 @@ async def test_document_preview_does_not_block_event_loop(
     def convert(*args, **kwargs):
         started.set()
         assert release.wait(2), "Event loop did not release the converter"
-        return b"# Converted\n"
+        return [b"# Converted\n"]
 
-    monkeypatch.setattr(extraction, "extract_document", convert)
+    monkeypatch.setattr(source_reader, "extract_documents_bounded", convert)
     query = SimpleNamespace(repo_root=tmp_path, target="spec.xyz")
     docs = {}
     operation = (
@@ -210,7 +217,7 @@ async def test_document_preview_does_not_block_event_loop(
 def test_symlink_routing_uses_indexed_path(
     tmp_path, extractor_registry, monkeypatch, document_alias
 ):
-    from repowise.core.ingestion import document_extractors as extraction
+    from repowise.core.ingestion import source_reader
     from repowise.core.ingestion.traverser import FileTraverser
     from repowise.server.mcp_server import _code_rationale, _edit_sites
     from repowise.server.mcp_server.tool_answer.data_shape import _read_lines
@@ -225,11 +232,11 @@ def test_symlink_routing_uses_indexed_path(
     assert files[alias.name].language == ("markdown" if document_alias else "python")
     calls = []
 
-    def convert(path, source):
-        calls.append(path)
-        return b"# Converted\n"
+    def convert(requests, **kwargs):
+        calls.extend(request[2] for request in requests)
+        return [b"# Converted\n"] * len(requests)
 
-    monkeypatch.setattr(extraction, "extract_document", convert)
+    monkeypatch.setattr(source_reader, "extract_documents_bounded", convert)
     assert read_repo_file_text(tmp_path, alias.name) == (
         "# Converted\n" if document_alias else "VALUE = 1\n"
     )

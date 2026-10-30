@@ -193,8 +193,6 @@ class FileInfo:
     # Plugin that extracts an otherwise unsupported source file as Markdown.
     extractor_name: str | None = None
     extractor_version: str | None = None
-    # Cached Markdown retained for downstream text consumers and source maps.
-    extracted_source: bytes | None = None
 
 
 @dataclass

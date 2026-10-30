@@ -320,7 +320,13 @@ change detection and deletion handling. The same current plugin claim is used
 when parsing working-tree files and historical Git blobs. Historical blobs are
 converted with the currently installed extractor; Repowise does not retain
 historical plugin implementations. The extractor's name, version and original
-source bytes participate in the parse-cache fingerprint. Bump `version` when
+source bytes participate in the parse-cache fingerprint. Extracted Markdown is
+cached behind the shared source reader under `.repowise/document-cache/`, so
+ingestion, historical blob parsing and appropriate MCP reads reuse conversion.
+Entries are keyed by original path, source bytes, extractor name and version.
+Cache corruption or unavailable storage causes reconversion, not lost content.
+The cache has no automatic eviction; removing this directory only causes
+reconversion. Bump `version` when
 extraction behaviour changes, then run `repowise init --force` to rebuild the
 repository index; an otherwise clean repository is not scanned just because a
 plugin version changed. Check `repowise plugins` to see which extractor owns a
@@ -336,11 +342,11 @@ Extraction runs in the existing spawned parse-worker pool with the
 disables the deadline). A timeout, worker crash, unavailable pool or extractor
 exception fails the indexing run;
 Repowise deliberately does not retry plugin code in-process. Source eligibility
-still applies to the original document. Extraction input and UTF-8 Markdown
-output use the existing Markdown size value (500 KiB by default, or the
-traverser's supplied limit), rather than a separate extraction cap. Output is
-checked inside the worker before returning it, and cached output is checked
-against the current limit too. Workers also check
+still applies to the original document before conversion. There is no separate
+size limit on extracted Markdown: output is expected to be smaller than the
+eligible source, but this is an assumption, not a guarantee. A plugin that
+expands small input can increase processing, cache and parent-process memory
+usage. Workers also check
 that the discovered extractor version matches the fingerprinted version. The
 existing worker memory cap (`REPOWISE_PARSE_WORKER_MEMORY_MB`, 2048 MiB by
 default; `0` disables it) is applied where the platform supports it, so these

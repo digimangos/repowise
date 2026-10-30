@@ -195,7 +195,7 @@ async def test_parse_cache_skips_extraction_until_source_or_version_changes(
     assert _extractor_calls(calls_file) == ["spec.xyz"]
     extracted = next(parsed for parsed in first if parsed.file_info.path == "docs/spec.xyz")
     expected = b"# Extracted document\n\nsource-v1\n"
-    assert extracted.file_info.extracted_source == expected
+    assert extracted.file_info.language == "markdown"
     assert source_map["docs/spec.xyz"] == expected
     assert not path.with_suffix(".md").exists()
 
@@ -240,60 +240,76 @@ def test_extractor_failure_names_plugin_and_path(tmp_path, extractor_registry, m
         ingestion_phase._split_cached(tmp_path, [(file_info, path.read_bytes())], None)
 
 
-@pytest.mark.parametrize("configured_limit", [None, 1024 * 1024])
-def test_extraction_output_is_capped_in_the_spawn_worker(
-    tmp_path, extractor_registry, monkeypatch, configured_limit
+@pytest.mark.asyncio
+async def test_extracted_markdown_can_exceed_source_size_limit(
+    tmp_path, extractor_registry, monkeypatch
 ):
-    from repowise.core.ingestion.document_extractors import extract_documents_bounded
     from repowise.core.ingestion.traverser import _DEFAULT_MAX_FILE_SIZE_BYTES
+    from repowise.server.mcp_server._helpers import read_repo_file_text
 
-    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
-    limit = _DEFAULT_MAX_FILE_SIZE_BYTES if configured_limit is None else configured_limit
-    options = {} if configured_limit is None else {"max_file_size_bytes": configured_limit}
-    prefix = b"# Extracted document\n\nsmall\n"
-    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_PADDING", str(limit - len(prefix)))
-    request = [("spawn-test-extractor", "1", tmp_path / "spec.xyz", "spec.xyz", b"small")]
-    assert len(extract_documents_bounded(request, **options)[0]) == limit
-    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_PADDING", str(limit - len(prefix) + 1))
-    with pytest.raises(DocumentExtractionError, match=f"{limit:,}-byte Markdown size limit"):
-        extract_documents_bounded(
-            request, **options
-        )
-
-
-def test_extraction_input_is_capped_without_running_the_plugin(tmp_path, extractor_registry):
-    from repowise.core.ingestion.document_extractors import (
-        extract_documents_bounded,
-    )
-    from repowise.core.ingestion.traverser import _DEFAULT_MAX_FILE_SIZE_BYTES
-
-    with pytest.raises(DocumentExtractionError, match="source exceeds"):
-        extract_documents_bounded(
-            [
-                (
-                    "not-dispatched",
-                    "1",
-                    tmp_path / "spec.xyz",
-                    "spec.xyz",
-                    b"x" * (_DEFAULT_MAX_FILE_SIZE_BYTES + 1),
-                )
-            ]
-        )
+    calls = tmp_path / "calls.txt"
+    _register_spawn_extractor(monkeypatch, calls)
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_PADDING", str(_DEFAULT_MAX_FILE_SIZE_BYTES))
+    (tmp_path / "spec.xyz").write_bytes(b"small")
+    parsed, _infos, _structure, source_map, *_ = await _ingest(tmp_path)
+    assert any(item.file_info.path == "spec.xyz" for item in parsed)
+    assert len(source_map["spec.xyz"]) > _DEFAULT_MAX_FILE_SIZE_BYTES
+    assert read_repo_file_text(tmp_path, "spec.xyz").encode() == source_map["spec.xyz"]
+    await _ingest(tmp_path)
+    assert _extractor_calls(calls) == ["spec.xyz"]
 
 
 @pytest.mark.asyncio
-async def test_cached_extraction_obeys_a_lowered_markdown_size_limit(
+async def test_shared_reader_cache_is_reused_and_corruption_reconverts(
     tmp_path, extractor_registry, monkeypatch
 ):
-    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
-    path = tmp_path / "spec.xyz"
-    path.write_bytes(b"small")
+    from repowise.server.mcp_server._helpers import read_repo_file_text
+
+    calls = tmp_path / "calls.txt"
+    _register_spawn_extractor(monkeypatch, calls)
+    (tmp_path / "spec.xyz").write_bytes(b"source")
+    expected = "# Extracted document\n\nsource\n"
+    # MCP can populate the same cache ingestion and historical blob reads use.
+    assert read_repo_file_text(tmp_path, "spec.xyz") == expected
     await _ingest(tmp_path)
-    info = next(FileTraverser(tmp_path).traverse())
-    with pytest.raises(DocumentExtractionError, match="Markdown size limit"):
-        ingestion_phase._split_cached(
-            tmp_path, [(info, path.read_bytes())], None, max_file_size_bytes=10
-        )
+    (tmp_path / ".repowise" / "parse_cache.pkl").write_bytes(b"corrupt parse cache")
+    parsed = ChangeDetector(tmp_path).parse_bytes(b"source", "spec.xyz")
+    assert parsed.file_info.language == "markdown"
+    assert _extractor_calls(calls) == ["spec.xyz"]
+    [entry] = (tmp_path / ".repowise" / "document-cache").iterdir()
+    entry.write_bytes(b"untrusted or corrupt cache")
+    assert read_repo_file_text(tmp_path, "spec.xyz") == expected
+    assert _extractor_calls(calls) == ["spec.xyz", "spec.xyz"]
+
+
+def test_shared_reader_cache_keeps_paths_distinct_and_tolerates_write_failure(
+    tmp_path, extractor_registry, monkeypatch
+):
+    from repowise.core import cache_seal
+    from repowise.core.ingestion import source_reader
+
+    _register("path-aware", FakeExtractor())
+    paths = [tmp_path / name for name in ("first.xyz", "second.xyz")]
+    for path in paths:
+        path.write_bytes(b"same bytes")
+    calls = []
+
+    def convert(requests):
+        calls.extend(request[2].name for request in requests)
+        return [request[2].name.encode() for request in requests]
+
+    monkeypatch.setattr(source_reader, "extract_documents_bounded", convert)
+    assert source_reader.read_source(tmp_path, paths[0].name) == b"first.xyz"
+    assert source_reader.read_source(tmp_path, paths[1].name) == b"second.xyz"
+    assert source_reader.read_source(tmp_path, paths[0].name) == b"first.xyz"
+    assert calls == ["first.xyz", "second.xyz"]
+
+    def unavailable(*args, **kwargs):
+        raise OSError("read-only cache")
+
+    monkeypatch.setattr(cache_seal, "dump_sealed_pickle", unavailable)
+    paths[0].write_bytes(b"new bytes")
+    assert source_reader.read_source(tmp_path, paths[0].name) == b"first.xyz"
 
 
 def test_extractor_timeout_fails_instead_of_running_unprotected(
@@ -351,8 +367,6 @@ def test_crashed_extractor_worker_fails_with_original_path(
 def test_worker_must_resolve_the_fingerprinted_extractor_version(
     tmp_path, extractor_registry, monkeypatch, changed_after_discovery
 ):
-    from repowise.core.ingestion.document_extractors import extract_document_source
-
     _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
     if not changed_after_discovery:
         document_extractors._impls["spawn-test-extractor"].version = "parent-only-version"
@@ -363,19 +377,17 @@ def test_worker_must_resolve_the_fingerprinted_extractor_version(
         document_extractors._impls["spawn-test-extractor"].version = "new-version"
         monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_VERSION", "new-version")
     with pytest.raises(DocumentExtractionError, match="version changed"):
-        extract_document_source(info, path.read_bytes())
+        ingestion_phase._split_cached(tmp_path, [(info, path.read_bytes())], None)
 
 
 def test_parent_only_registration_fails_explicitly(tmp_path, extractor_registry, monkeypatch):
-    from repowise.core.ingestion.document_extractors import extract_document_source
-
     monkeypatch.delenv("REPOWISE_PLUGINS", raising=False)
     _register("parent-only", FakeExtractor())
     path = tmp_path / "spec.xyz"
     path.write_bytes(b"source")
     info = next(FileTraverser(tmp_path).traverse())
     with pytest.raises(DocumentExtractionError, match=r"parent-only.*spec\.xyz.*not discoverable"):
-        extract_document_source(info, path.read_bytes())
+        ingestion_phase._split_cached(tmp_path, [(info, path.read_bytes())], None)
 
 
 def test_exclusions_and_size_limit_run_before_extraction(tmp_path, extractor_registry):
@@ -411,7 +423,7 @@ def test_change_detector_uses_extracted_markdown_and_original_path(
     assert parsed is not None
     assert parsed.file_info.path == "spec.xyz"
     assert parsed.file_info.language == "markdown"
-    assert parsed.content_hash != hashlib.sha256(parsed.file_info.extracted_source).hexdigest()
+    assert parsed.content_hash != hashlib.sha256(b"# Extracted document\n\n\x00binary source\n").hexdigest()
     assert _extractor_calls(calls_file) == ["spec.xyz"]
 
 
@@ -510,9 +522,9 @@ async def test_cached_document_diff_needs_no_conversion(tmp_path, extractor_regi
     assert detector.parse_bytes(b"VALUE = 1", "main.py") is not None
     assert loads == []
     parsed = detector.parse_bytes(path.read_bytes(), "spec.xyz")
-    assert parsed.file_info.extracted_source == b"# Extracted document\n\nsource\n"
+    assert parsed.file_info.language == "markdown"
     again = detector.parse_bytes(path.read_bytes(), "spec.xyz")
-    assert again.file_info.extracted_source == parsed.file_info.extracted_source
+    assert again.content_hash == parsed.content_hash
     assert again is not parsed
     assert len(loads) == 1
     assert _extractor_calls(calls) == ["spec.xyz"]

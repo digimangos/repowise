@@ -9,7 +9,6 @@ from typing import Protocol
 from repowise.core.registry.plugins import SeamRegistry
 
 from .models import FileInfo
-from .traverser import _DEFAULT_MAX_FILE_SIZE_BYTES
 
 
 class DocumentExtractor(Protocol):
@@ -133,6 +132,11 @@ def source_fingerprint(file_info: FileInfo, source: bytes) -> str:
     version = file_info.extractor_version
     if name is None or version is None:
         return hashlib.sha256(source).hexdigest()
+    return document_fingerprint(name, version, source)
+
+
+def document_fingerprint(name: str, version: str, source: bytes) -> str:
+    """Identity of source bytes under a particular extractor implementation."""
     digest = hashlib.sha256()
     digest.update(b"repowise-document-extractor\0")
     digest.update(name.encode("utf-8"))
@@ -143,45 +147,9 @@ def source_fingerprint(file_info: FileInfo, source: bytes) -> str:
     return digest.hexdigest()
 
 
-def extract_document_source(
-    file_info: FileInfo,
-    source: bytes,
-    *,
-    max_file_size_bytes: int = _DEFAULT_MAX_FILE_SIZE_BYTES,
-) -> bytes:
-    """Return bounded extracted Markdown bytes, raising a named error on failure."""
-    name = file_info.extractor_name
-    if name is None:
-        return source
-    return extract_documents_bounded(
-        [(name, file_info.extractor_version, Path(file_info.abs_path), file_info.path, source)],
-        max_file_size_bytes=max_file_size_bytes,
-    )[0]
-
-
-def extract_document(
-    path: Path | str,
-    source: bytes,
-    *,
-    max_file_size_bytes: int = _DEFAULT_MAX_FILE_SIZE_BYTES,
-) -> bytes:
-    """Extract a claimed unsupported file for a text-serving caller."""
-    from .traverser import _detect_language
-
-    path = Path(path)
-    claim = document_extractor_for_path(path, language=_detect_language(path, source))
-    if claim is None:
-        return source
-    name, extractor = claim
-    return extract_documents_bounded(
-        [(name, extractor.version, path, str(path), source)],
-        max_file_size_bytes=max_file_size_bytes,
-    )[0]
-
-
-def _extract_worker(task: tuple[str, str, str, bytes, int]) -> bytes:
+def _extract_worker(task: tuple[str, str, str, bytes]) -> bytes:
     """Spawn-pool worker; plugins are rediscovered in the spawned process."""
-    name, version, path_text, source, max_file_size_bytes = task
+    name, version, path_text, source = task
     path = Path(path_text)
     try:
         extractor = dict(document_extractors.all())[name]
@@ -194,46 +162,17 @@ def _extract_worker(task: tuple[str, str, str, bytes, int]) -> bytes:
             f"document extractor {name!r} version changed from {version!r} "
             f"to {extractor.version!r} in the spawned worker for {path}"
         )
-    encoded = _extract(name, extractor, path, path_text, source)
-    validate_document_output(name, path_text, encoded, max_file_size_bytes=max_file_size_bytes)
-    return encoded
-
-
-def validate_document_output(
-    name: str,
-    path: str,
-    source: bytes,
-    *,
-    max_file_size_bytes: int = _DEFAULT_MAX_FILE_SIZE_BYTES,
-) -> None:
-    """Apply the ordinary Markdown size policy to extracted UTF-8 bytes."""
-    from .traverser import size_verdict
-
-    if size_verdict(Path("extracted.md"), len(source), max_file_size_bytes=max_file_size_bytes):
-        raise DocumentExtractionError(
-            f"document extractor {name!r} failed for {path}: "
-            f"output exceeds the {max_file_size_bytes:,}-byte Markdown size limit"
-        )
+    return _extract(name, extractor, path, source)
 
 
 def extract_documents_bounded(
     requests: list[tuple[str, str, Path, str, bytes]],
-    *,
-    max_file_size_bytes: int = _DEFAULT_MAX_FILE_SIZE_BYTES,
 ) -> list[bytes]:
-    """Extract a batch in the spawn pool; pool failures never run inline."""
+    """Extract eligible sources in the spawn pool; pool failures never run inline."""
     if not requests:
         return []
-    for name, _version, _path, display_path, source in requests:
-        if len(source) > max_file_size_bytes:
-            raise DocumentExtractionError(
-                f"document extractor {name!r} refused {display_path}: "
-                f"source exceeds {max_file_size_bytes:,} bytes"
-            )
     from repowise.core.pipeline.parse_pool import (
         PENDING,
-        ParseTimeoutError,
-        ParseWorkerCrashError,
         parse_timeout_s,
         run_with_deadline,
     )
@@ -244,7 +183,7 @@ def extract_documents_bounded(
         run_with_deadline(
             _extract_worker,
             [
-                (name, version, str(path), source, max_file_size_bytes)
+                (name, version, str(path), source)
                 for name, version, path, _display_path, source in requests
             ],
             parse_pool_workers(len(requests)),
@@ -260,10 +199,6 @@ def extract_documents_bounded(
     for (name, _version, _path, display_path, _source), result in zip(
         requests, results, strict=True
     ):
-        if isinstance(result, ParseTimeoutError | ParseWorkerCrashError):
-            raise DocumentExtractionError(
-                f"document extractor {name!r} failed for {display_path}: {result}"
-            ) from result
         if isinstance(result, BaseException):
             raise DocumentExtractionError(
                 f"document extractor {name!r} failed for {display_path}: {result}"
@@ -284,16 +219,14 @@ def _extract(
     name: str,
     extractor: DocumentExtractor,
     extractor_path: Path,
-    display_path: str,
     source: bytes,
 ) -> bytes:
     try:
         markdown = extractor.extract(extractor_path, source)
         if not isinstance(markdown, str):
             raise TypeError("extract() must return Markdown as str")
-        encoded = markdown.encode("utf-8")
-        return encoded
+        return markdown.encode("utf-8")
     except Exception as exc:
         raise DocumentExtractionError(
-            f"document extractor {name!r} failed for {display_path}: {exc}"
+            f"document extractor {name!r} failed for {extractor_path}: {exc}"
         ) from exc

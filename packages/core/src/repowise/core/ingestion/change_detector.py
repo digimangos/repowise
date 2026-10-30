@@ -610,7 +610,6 @@ class ChangeDetector:
 
         from .document_extractors import (
             document_extractor_for_path,
-            extract_document_source,
             source_fingerprint,
         )
         from .parser import parse_file
@@ -641,29 +640,22 @@ class ChangeDetector:
             extractor_version=extractor.version if extractor is not None else None,
         )
         try:
+            parse_source = source
             if extractor_name is not None:
                 from .parse_cache import ParseCache
+                from .source_reader import read_document_sources
+
+                parse_source = read_document_sources(
+                    self.repo_path,
+                    [(extractor_name, extractor.version, Path(file_info.abs_path), path, source)],
+                )[0]
 
                 if self._document_cache is None:
                     self._document_cache = ParseCache(self.repo_path / ".repowise")
                     self._document_cache.load()
                 cached = self._document_cache.get(file_info, source_fingerprint(file_info, source))
                 if cached is not None:
-                    from .document_extractors import validate_document_output
-
-                    validate_document_output(
-                        extractor_name, path, file_info.extracted_source,
-                        max_file_size_bytes=self._document_policy.max_file_size_bytes,
-                    )
                     return cached
-            if extractor_name is not None:
-                parse_source = extract_document_source(
-                    file_info, source,
-                    max_file_size_bytes=self._document_policy.max_file_size_bytes,
-                )
-            else:
-                parse_source = source
-            file_info.extracted_source = parse_source if extractor_name is not None else None
             parsed = parse_file(file_info, parse_source)
             parsed.content_hash = source_fingerprint(file_info, source)
             return parsed

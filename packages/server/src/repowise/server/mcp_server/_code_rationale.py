@@ -285,18 +285,13 @@ def _read_text(repo_root: Path, file_path: str) -> str | None:
     try:
         abs_path = (repo_root / file_path).resolve()
         abs_path.relative_to(repo_root.resolve())
-        from repowise.core.ingestion.document_extractors import is_extracted_document
-
-        if abs_path.stat().st_size > _MAX_FILE_LINES * 400 or is_extracted_document(
-            repo_root / file_path
-        ):
+        if abs_path.stat().st_size > _MAX_FILE_LINES * 400:
             return None
     except (ValueError, OSError):
         return None
-    try:
-        return abs_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+    from repowise.server.mcp_server._helpers import read_repo_file_text
+
+    return read_repo_file_text(repo_root, file_path, allow_extracted=False)
 
 
 def _truncate_block(comment: str) -> str:

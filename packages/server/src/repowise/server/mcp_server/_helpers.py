@@ -698,38 +698,19 @@ def read_repo_file_text(
     Source-coordinate readers must set ``allow_extracted=False``. Async callers
     allowing extraction must offload this synchronous reader.
 
-    Several tool modules still carry their own near-identical copy of this,
-    each with one extra behaviour bolted on (a size ceiling, lines instead of
-    text). Those are left alone here rather than churned, but new callers
-    belong on this one, and a copy that needs a variation should wrap it.
+    Classification, containment and conversion belong to the core source reader;
+    this optional serving boundary translates extraction failures to unavailable.
     """
     if repo_root is None:
         return None
-    from repowise.core.ingestion.document_extractors import (
-        DocumentExtractionError,
-        extract_document,
-        is_extracted_document,
-    )
+    from repowise.core.ingestion.document_extractors import DocumentExtractionError
+    from repowise.core.ingestion.source_reader import read_source
 
     try:
-        root = Path(str(repo_root))
-        indexed_path = root / file_path
-        abs_path = indexed_path.resolve()
-        abs_path.relative_to(root.resolve())
-
-        from repowise.core.ingestion.traverser import _DEFAULT_MAX_FILE_SIZE_BYTES
-
-        if is_extracted_document(indexed_path):
-            if not allow_extracted:
-                return None
-            with abs_path.open("rb") as stream:
-                source = stream.read(_DEFAULT_MAX_FILE_SIZE_BYTES + 1)
-            if len(source) > _DEFAULT_MAX_FILE_SIZE_BYTES:
-                return None
-            source = extract_document(indexed_path, source)
-        else:
-            source = abs_path.read_bytes()
-        return source.decode("utf-8", errors="replace")
+        source = read_source(Path(str(repo_root)), file_path, allow_extracted=allow_extracted)
+        if source is None:
+            return None
+        return source.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     except (OSError, ValueError, DocumentExtractionError):
         return None
 
