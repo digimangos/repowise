@@ -233,23 +233,32 @@ def test_extractor_failure_names_plugin_and_path(tmp_path, extractor_registry, m
         ingestion_phase._split_cached(tmp_path, [(file_info, path.read_bytes())], None)
 
 
-def test_extraction_output_is_capped_in_the_spawn_worker(tmp_path, extractor_registry, monkeypatch):
+@pytest.mark.parametrize("configured_limit", [None, 1024 * 1024])
+def test_extraction_output_is_capped_in_the_spawn_worker(
+    tmp_path, extractor_registry, monkeypatch, configured_limit
+):
     from repowise.core.ingestion.document_extractors import extract_documents_bounded
+    from repowise.core.ingestion.traverser import _DEFAULT_MAX_FILE_SIZE_BYTES
 
     _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
-    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_PADDING", "8388609")
-
-    with pytest.raises(DocumentExtractionError, match="8,388,608-byte extraction limit"):
+    limit = _DEFAULT_MAX_FILE_SIZE_BYTES if configured_limit is None else configured_limit
+    options = {} if configured_limit is None else {"max_file_size_bytes": configured_limit}
+    prefix = b"# Extracted document\n\nsmall\n"
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_PADDING", str(limit - len(prefix)))
+    request = [("spawn-test-extractor", "1", tmp_path / "spec.xyz", "spec.xyz", b"small")]
+    assert len(extract_documents_bounded(request, **options)[0]) == limit
+    monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_PADDING", str(limit - len(prefix) + 1))
+    with pytest.raises(DocumentExtractionError, match=f"{limit:,}-byte Markdown size limit"):
         extract_documents_bounded(
-            [("spawn-test-extractor", "1", tmp_path / "spec.xyz", "spec.xyz", b"small")]
+            request, **options
         )
 
 
 def test_extraction_input_is_capped_without_running_the_plugin(tmp_path, extractor_registry):
     from repowise.core.ingestion.document_extractors import (
-        MAX_DOCUMENT_INPUT_BYTES,
         extract_documents_bounded,
     )
+    from repowise.core.ingestion.traverser import _DEFAULT_MAX_FILE_SIZE_BYTES
 
     with pytest.raises(DocumentExtractionError, match="source exceeds"):
         extract_documents_bounded(
@@ -259,9 +268,24 @@ def test_extraction_input_is_capped_without_running_the_plugin(tmp_path, extract
                     "1",
                     tmp_path / "spec.xyz",
                     "spec.xyz",
-                    b"x" * (MAX_DOCUMENT_INPUT_BYTES + 1),
+                    b"x" * (_DEFAULT_MAX_FILE_SIZE_BYTES + 1),
                 )
             ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_cached_extraction_obeys_a_lowered_markdown_size_limit(
+    tmp_path, extractor_registry, monkeypatch
+):
+    _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt")
+    path = tmp_path / "spec.xyz"
+    path.write_bytes(b"small")
+    await _ingest(tmp_path)
+    info = next(FileTraverser(tmp_path).traverse())
+    with pytest.raises(DocumentExtractionError, match="Markdown size limit"):
+        ingestion_phase._split_cached(
+            tmp_path, [(info, path.read_bytes())], None, max_file_size_bytes=10
         )
 
 

@@ -53,13 +53,12 @@ def test_code_source_reader_keeps_a_shebang_script_on_the_code_path(tmp_path, ex
 def test_extracted_mcp_reads_enforce_input_budget_before_plugin_call(
     tmp_path, extractor_registry, monkeypatch
 ):
-    from repowise.core.ingestion import document_extractors as extractor_module
+    from repowise.core.ingestion.traverser import _DEFAULT_MAX_FILE_SIZE_BYTES
 
-    monkeypatch.setattr(extractor_module, "MAX_DOCUMENT_INPUT_BYTES", 3)
     calls = tmp_path / "calls.txt"
     monkeypatch.setenv("REPOWISE_TEST_EXTRACTOR_CALLS", str(calls))
     document = tmp_path / "spec.xyz"
-    document.write_bytes(b"four")
+    document.write_bytes(b"x" * (_DEFAULT_MAX_FILE_SIZE_BYTES + 1))
 
     assert read_repo_file_text(tmp_path, "spec.xyz") is None
     assert not calls.exists()

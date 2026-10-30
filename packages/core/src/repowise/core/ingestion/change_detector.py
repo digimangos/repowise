@@ -647,8 +647,20 @@ class ChangeDetector:
                 cache.load()
                 cached = cache.get(file_info, source_fingerprint(file_info, source))
                 if cached is not None:
+                    from .document_extractors import validate_document_output
+
+                    validate_document_output(
+                        extractor_name, path, file_info.extracted_source,
+                        max_file_size_bytes=self._document_policy.max_file_size_bytes,
+                    )
                     return cached
-            parse_source = extract_document_source(file_info, source)
+            if extractor_name is not None:
+                parse_source = extract_document_source(
+                    file_info, source,
+                    max_file_size_bytes=self._document_policy.max_file_size_bytes,
+                )
+            else:
+                parse_source = source
             file_info.extracted_source = parse_source if extractor_name is not None else None
             parsed = parse_file(file_info, parse_source)
             parsed.content_hash = source_fingerprint(file_info, source)

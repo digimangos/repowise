@@ -334,9 +334,12 @@ Extraction runs in the existing spawned parse-worker pool with the
 `REPOWISE_PARSE_TIMEOUT_S` per-file deadline (60 seconds by default; `0`
 disables the deadline). A timeout, worker crash, unavailable pool or extractor
 exception fails the indexing run;
-Repowise deliberately does not retry plugin code in-process. Each input and
-Markdown output is capped at 8 MiB; normal ingestion eligibility still uses the
-existing unsupported-file size limit (500 KiB by default). Workers also check
+Repowise deliberately does not retry plugin code in-process. Source eligibility
+still applies to the original document. Extraction input and UTF-8 Markdown
+output use the existing Markdown size value (500 KiB by default, or the
+traverser's supplied limit), rather than a separate extraction cap. Output is
+checked inside the worker before returning it, and cached output is checked
+against the current limit too. Workers also check
 that the discovered extractor version matches the fingerprinted version. The
 existing worker memory cap (`REPOWISE_PARSE_WORKER_MEMORY_MB`, 2048 MiB by
 default; `0` disables it) is applied where the platform supports it, so these

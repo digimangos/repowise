@@ -53,7 +53,9 @@ def reparse_repo(
     repo_structure = traverser.get_repo_structure()
 
     fi_and_bytes = _read_sources(file_infos, None)
-    parse_cache, cached_hits, to_parse = _split_cached(repo_path, fi_and_bytes, None)
+    parse_cache, cached_hits, to_parse = _split_cached(
+        repo_path, fi_and_bytes, None, max_file_size_bytes=traverser.max_file_size_bytes
+    )
     # Share init/update's extractor-aware cache and bounded extraction route.
     results = parse_guarded(to_parse)
     report_parse_failures(to_parse, results)
