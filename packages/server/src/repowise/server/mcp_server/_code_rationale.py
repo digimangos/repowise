@@ -44,7 +44,6 @@ from repowise.core.analysis.decisions.rationale_comments import (
 )
 from repowise.core.analysis.decisions.rationale_harvest import (
     harvest_repo_rationale,
-    read_repo_text,
 )
 from repowise.core.exclusion import build_exclude_spec, is_excluded
 from repowise.server.mcp_server._why_relevance import (
@@ -307,7 +306,7 @@ def _file_blocks(
 ) -> list[tuple[str, int, int, str, frozenset[str], frozenset[str]]]:
     """``(path, start, end, comment, words, own words)`` per comment block of *path*."""
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    text = read_repo_text(root, path)
+    text = _read_text(root, path)
     if text is None or text.count("\n") > _MAX_FILE_LINES:
         return []
     try:
