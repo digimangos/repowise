@@ -5,15 +5,28 @@ from __future__ import annotations
 import hashlib
 import logging
 from pathlib import Path
+from typing import NamedTuple
 
 from .document_extractors import (
     document_fingerprint,
+    document_source_ceiling,
     extract_documents_bounded,
     is_extracted_document,
 )
-from .traverser import _DEFAULT_MAX_FILE_SIZE_BYTES
+from .traverser import _DEFAULT_MAX_FILE_SIZE_BYTES, _SOURCE_MAX_FILE_SIZE_BYTES
 
 _log = logging.getLogger(__name__)
+
+
+class OverCeiling(NamedTuple):
+    """Extracted Markdown too large to index, by its size in bytes."""
+
+    size_bytes: int
+
+
+def _extracted_over_ceiling(markdown: bytes) -> bool:
+    """Whether extracted Markdown is too large to index (the parseable-source ceiling)."""
+    return len(markdown) > _SOURCE_MAX_FILE_SIZE_BYTES
 
 
 def read_document_sources(
@@ -21,11 +34,12 @@ def read_document_sources(
     requests: list[tuple[str, str, Path, str, bytes]],
     *,
     write_cache: bool = True,
-) -> list[bytes]:
+) -> list[bytes | OverCeiling]:
     """Read cached Markdown or batch-convert already eligible working-tree/Git bytes.
 
-    Source-size checks belong before this boundary. Extracted output is expected
-    to be smaller than its source and has no separate size ceiling.
+    Source-size checks belong before this boundary. Markdown over
+    :data:`_SOURCE_MAX_FILE_SIZE_BYTES` comes back as :class:`OverCeiling` and
+    is never cached: the document is not indexed.
     """
     from repowise.core.cache_seal import dump_sealed_pickle, load_sealed_pickle
 
@@ -55,13 +69,17 @@ def read_document_sources(
     )
     for (index, cache_path, domain), markdown in zip(missing, converted, strict=True):
         outputs[index] = markdown
-        if not write_cache:
+        if not write_cache or _extracted_over_ceiling(markdown):
             continue
         try:
             dump_sealed_pickle(cache_path, markdown, domain=domain)
         except Exception as exc:
             _log.debug("Could not cache document %s: %s", requests[index][3], exc)
-    return [outputs[index] for index in range(len(requests))]
+    results = [outputs[index] for index in range(len(requests))]
+    return [
+        OverCeiling(len(markdown)) if _extracted_over_ceiling(markdown) else markdown
+        for markdown in results
+    ]
 
 
 def read_source(
@@ -86,9 +104,10 @@ def read_source(
             return resolved.read_bytes()
         if not allow_extracted:
             return None
+        ceiling = document_source_ceiling(indexed_path, _DEFAULT_MAX_FILE_SIZE_BYTES)
         with resolved.open("rb") as stream:
-            source = stream.read(_DEFAULT_MAX_FILE_SIZE_BYTES + 1)
-        if len(source) > _DEFAULT_MAX_FILE_SIZE_BYTES:
+            source = stream.read(ceiling + 1)
+        if len(source) > ceiling:
             return None
     except (OSError, ValueError):
         return None
@@ -98,7 +117,8 @@ def read_source(
     if claim is None:
         return source
     name, extractor = claim
-    return read_document_sources(
+    markdown = read_document_sources(
         repo_path,
         [(name, extractor.version, indexed_path, file_path, source)],
     )[0]
+    return markdown if isinstance(markdown, bytes) else None
