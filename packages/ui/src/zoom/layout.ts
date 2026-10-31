@@ -22,6 +22,7 @@ import {
   PACK_SIZE_MAX,
   PACK_SIZE_MIN,
 } from "./constants";
+import { fileLevelLayout } from "./layout-files";
 import type { ZoomKind } from "./types";
 
 /** The minimal slice of a node the layout needs (placement order + sizing). */
@@ -318,6 +319,10 @@ export function packLayout(
   relations: readonly LayoutRelation[] = [],
   asideIds?: ReadonlySet<string>,
 ): Map<string, Rect> {
+  // A parent of mostly files gets grouped tiles instead (see `layout-files.ts`):
+  // sections sorted by health, so sibling links and set-asides do not apply.
+  const tiles = fileLevelLayout(children, parentAspect);
+  if (tiles) return tiles;
   const aside = asideIds ? children.filter((c) => asideIds.has(c.id)) : [];
   if (aside.length === 0 || aside.length === children.length) {
     return packRanked(children, parentAspect, opts, relations);
