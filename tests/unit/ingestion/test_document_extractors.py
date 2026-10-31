@@ -230,6 +230,40 @@ async def test_reparse_uses_cached_markdown_in_its_source_map(
     assert _extractor_calls(calls_file) == ["spec.xyz"]
 
 
+@pytest.mark.asyncio
+async def test_reparse_leaves_the_parse_cache_file_untouched(tmp_path, extractor_registry):
+    (tmp_path / "app.py").write_text("def one():\n    return 1\n", encoding="utf-8")
+    await _ingest(tmp_path)
+    cache_file = tmp_path / ".repowise" / "parse_cache.pkl"
+    before = cache_file.read_bytes()
+    (tmp_path / "app.py").write_text("def two():\n    return 2\n", encoding="utf-8")
+
+    from repowise.core.pipeline.reparse import reparse_repo
+
+    parsed, _source_map, _structure = reparse_repo(tmp_path, [])
+
+    assert [s.name for item in parsed for s in item.symbols] == ["two"]
+    assert cache_file.read_bytes() == before
+
+
+def test_reparse_extracts_without_writing_the_document_cache(
+    tmp_path, extractor_registry, monkeypatch
+):
+    calls_file = tmp_path / "extractor-calls.txt"
+    _register_spawn_extractor(monkeypatch, calls_file)
+    (tmp_path / "spec.xyz").write_bytes(b"source")
+
+    from repowise.core.pipeline.reparse import reparse_repo
+
+    _parsed, source_map, _structure = reparse_repo(tmp_path, [])
+
+    assert source_map["spec.xyz"] == b"# Extracted document\n\nsource\n"
+    assert _extractor_calls(calls_file) == ["spec.xyz"]
+    document_cache = tmp_path / ".repowise" / "document-cache"
+    assert not document_cache.exists() or not any(document_cache.iterdir())
+    assert not (tmp_path / ".repowise" / "parse_cache.pkl").exists()
+
+
 def test_extractor_failure_names_plugin_and_path(tmp_path, extractor_registry, monkeypatch):
     _register_spawn_extractor(monkeypatch, tmp_path / "calls.txt", fail=True)
     path = tmp_path / "spec.xyz"
