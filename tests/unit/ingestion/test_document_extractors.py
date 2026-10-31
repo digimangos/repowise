@@ -505,6 +505,7 @@ def test_stale_extracted_document_deleted_when_traversal_excludes_it(tmp_path, e
         ("ignored.xyz", None, ["*.xyz"], b"source"),
         ("large.xyz", None, None, b"x" * (501 * 1024)),
     ],
+    ids=["repowiseignore", "nested-repowiseignore", "exclude-pattern", "oversized"],
 )
 def test_diff_document_eligibility_checks_supplied_bytes_before_conversion(
     tmp_path, extractor_registry, path, ignore_file, patterns, source
